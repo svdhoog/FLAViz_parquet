@@ -1,3 +1,8 @@
+
+## Main goal
+The main goal of this project is to re-engineer the FLAViz FLAME vizualization library to use Apache Arrow and Parquet data files.
+A third element is to use duckDB to use SQL-like query statements to perform ETL processes.
+
 ## 🗺️ Project Roadmap
 
 ### Phase 1: FLAViz Visualization Layer
