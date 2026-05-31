@@ -3,6 +3,26 @@
 The main goal of this project is to re-engineer the FLAViz FLAME vizualization library to use Apache Arrow and Parquet data files.
 A third element is to use duckDB to use SQL-like query statements to perform ETL processes.
 
+The project can be visualized by this component diagram:
+```
++--------------------------------------------------+
+|               FLAME Core Engine                  |
+|  (C-Based State Machine Execution Environment)   |
++----------------------------------------+---------+
+                     |
+Hook Invocation      v
++--------------------------------------------------+
+|          High-Performance Data Backend           |
+|   (C++ / Apache Arrow / Columnar Parquet API)    |
++----------------------------------------+---------+
+                     |
+High-Speed Disk I/O  v
++--------------------------------------------------+
+|           FLAViz Visualization Layer             |
+|   (Dynamic Agent Tracking, Ingestion & Rendering) |
++--------------------------------------------------+
+```
+
 ## 🗺️ Project Roadmap
 
 ### Phase 1: FLAViz Visualization Layer
