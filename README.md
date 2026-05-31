@@ -3,6 +3,19 @@
 The main goal of this project is to re-engineer the FLAViz FLAME vizualization library to use Apache Arrow and Parquet data files.
 A third element is to use duckDB to use SQL-like query statements to perform ETL processes.
 
+AI proposed this summary (which is longer):
+
+The primary objective of this project is to re-engineer the data backend of the FLAME simulation environment and its companion visualization tool, FLAViz, to utilize Apache Arrow and Parquet columnar storage formats. A secondary milestone integrates DuckDB to execute high-speed, SQL-driven ETL (Extract, Transform, Load) operations directly on the generated dataset, optimizing the data pipeline for real-time visualization and analytics.
+
+**Why this structure works perfectly:**
+
+  1. The Core Switch (Parquet): It establishes that you are moving from high-overhead serialization (XML) to compressed, high-performance columnar files (.parquet).
+
+  2. The Memory Layer (Apache Arrow): It highlights that data isn't just fast on disk, but efficiently structured in-memory for the visualization tool.
+
+  3. The Analytics Engine (DuckDB): It leverages DuckDB's exact strength—acting as an embedded vectorization engine that runs incredibly fast SQL queries directly on top of Parquet files without needing to spin up a heavy database server.
+
+**Diagram**
 The project can be visualized by this component diagram:
 ```
 +--------------------------------------------------+
