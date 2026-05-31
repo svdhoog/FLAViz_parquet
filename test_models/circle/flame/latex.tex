@@ -1,0 +1,158 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[table]{xcolor}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{euscript}
+\usepackage{boxedminipage}
+\usepackage{lscape}
+\usepackage{minitoc}
+\usepackage{epsfig,psfrag,graphicx,verbatim}
+\usepackage{natbib}
+\usepackage{booktabs, longtable}
+\usepackage{url}
+\usepackage{makeidx}
+
+%% Define a new 'code' style for the url package that will use a sans serif font.
+\makeatletter
+\def\url@codestyle{%
+  \@ifundefined{selectfont}{\def\UrlFont{\sf}}{\def\UrlFont{\sffamily}}}
+\makeatother
+%% Now actually use the newly defined style.
+\urlstyle{code}
+
+\vfuzz2pt % Don't report over-full v-boxes if over-edge is small
+\hfuzz2pt % Don't report over-full h-boxes if over-edge is small
+\setlength{\oddsidemargin}{0cm}
+\setlength{\evensidemargin}{0cm}
+\setlength{\textwidth}{16cm}
+\setlength{\textheight}{23cm}
+\title{Test Model - Xparser 0.17.1 Circle (x,y)-coordinates Reference Manual}
+\author{Author names to add}
+\date{\today}
+
+\makeindex
+
+\begin{document}
+\rowcolors[]{2}{lightgray!40}{yellow!25} %% color table rows with alternating colors
+\maketitle
+\tableofcontents
+\clearpage
+
+\section{Test Model - Xparser 0.17.1 Circle (x,y)-coordinates FLAME Implementation}
+
+\subsection{Agent}
+
+\begin{longtable}[H!]{ll}
+\caption{{\bfseries List of memory variables for Agent agent.}}
+\label{Table: Agent Memory}\\
+\toprule 
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endfirsthead
+\multicolumn{2}{c}%
+{{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\
+\toprule
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endhead
+\multicolumn{2}{r}{{\emph{Continued on next page}}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+\midrule
+\parbox{5cm}{\url{int} \url{id}} \index{\url{id}} & \parbox{10cm}{Agent ID.} \\
+\midrule
+\parbox{5cm}{\url{double} \url{x}} \index{\url{x}} & \parbox{10cm}{Agent x coordinate.} \\
+\midrule
+\parbox{5cm}{\url{double} \url{y}} \index{\url{y}} & \parbox{10cm}{Agent y coordinate.} \\
+\midrule
+\parbox{5cm}{\url{double} \url{a}} \index{\url{a}} & \parbox{10cm}{Agent x-axis offset.} \\
+\midrule
+\parbox{5cm}{\url{double} \url{b}} \index{\url{b}} & \parbox{10cm}{Agent y-axis offset.} \\
+\end{longtable}
+\begin{longtable}[H!]{ll}
+\caption{{\bfseries List of functions for Agent agent.}}
+\label{Table: Agent Functions}\\
+\toprule 
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endfirsthead
+\multicolumn{2}{c}%
+{{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\
+\toprule
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endhead
+\multicolumn{2}{r}{{\emph{Continued on next page}}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+\midrule
+\parbox{5cm}{\url{set_xy}} \index{\url{set_xy}} & \parbox{10cm}{} \\
+\end{longtable}
+\subsection{Messages}
+See Table \ref{Table: Messages}.\begin{longtable}[H!]{ll}
+\caption{{\bfseries List of messages.}}
+\label{Table: Messages}\\
+\toprule 
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endfirsthead
+\multicolumn{2}{c}%
+{{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\
+\toprule
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endhead
+\multicolumn{2}{r}{{\emph{Continued on next page}}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+\end{longtable}
+\subsection{Constants}
+\begin{longtable}[H!]{ll}
+\caption{{\bfseries List of constants.}}
+\label{Table: constants}\\
+\toprule 
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endfirsthead
+\multicolumn{2}{c}%
+{{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\
+\toprule
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endhead
+\multicolumn{2}{r}{{\emph{Continued on next page}}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+\url{int} \url{set_no} \index{\url{set_no}} & \parbox{10cm}{}\\
+\url{int} \url{run} \index{\url{run}} & \parbox{10cm}{}\\
+\url{double} \url{const_radius} \index{\url{const_radius}} & \parbox{10cm}{}\\
+\url{double} \url{const_b} \index{\url{const_b}} & \parbox{10cm}{}\\
+\end{longtable}
+\subsection{Datatypes}
+\begin{longtable}[H!]{ll}
+\caption{{\bfseries List of attributes for ADTs.}}
+\label{Table: datatypes}\\
+\toprule 
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endfirsthead
+\multicolumn{2}{c}%
+{{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\
+\toprule
+\bfseries Name & \bfseries Description \\ \hline 
+\midrule
+\endhead
+\multicolumn{2}{r}{{\emph{Continued on next page}}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+\end{longtable}
+
+\printindex
+
+\end{document}

@@ -1,0 +1,48 @@
+================================================================================
+FLAVIZ DATASET ARCHITECTURE REPORT
+Target Directory: /home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data/output/pqt
+================================================================================
+
+[+] Parameter Sets Detected (4 total):
+    - set_1
+    - set_2
+    - set_3
+    - set_4
+
+--------------------------------------------------------------------------------
+DIAGNOSTIC MATRIX BY PARAMETER SET
+--------------------------------------------------------------------------------
+
+* Parameter Set: set_1
+  └── Total Monte Carlo Runs (Seeds): 2
+  ├── Timeline Profile: Iterations: 1 to 628 (628 discrete ticks)
+  │   ├── Agent Found: 'Agent'
+
+* Parameter Set: set_2
+  └── Total Monte Carlo Runs (Seeds): 2
+  ├── Timeline Profile: Iterations: 1 to 628 (628 discrete ticks)
+  │   ├── Agent Found: 'Agent'
+
+* Parameter Set: set_3
+  └── Total Monte Carlo Runs (Seeds): 2
+  ├── Timeline Profile: Iterations: 1 to 628 (628 discrete ticks)
+  │   ├── Agent Found: 'Agent'
+
+* Parameter Set: set_4
+  └── Total Monte Carlo Runs (Seeds): 2
+  ├── Timeline Profile: Iterations: 1 to 628 (628 discrete ticks)
+  │   ├── Agent Found: 'Agent'
+
+================================================================================
+COMPREHENSIVE AGENT ATTRIBUTE SCHEMA MANIFEST
+================================================================================
+
+[Agent Class: Agent]
+Total Columns/Variables (Excl. Iteration Indices): 5
+----------------------------------------
+  id    x     y     
+  a     b     
+
+================================================================================
+Inspection complete. Total unique Monte Carlo cells traversed: 8
+================================================================================
