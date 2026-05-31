@@ -1,0 +1,29 @@
+digraph state_graph {
+	rankdir=TB;
+	size="8,5;"
+	
+	/* Layers */
+	layer_0 [shape=plaintext, label="layer 0"];
+	layer_0_b [style=invis, shape=point];
+	layer_0_a [style=invis, shape=point];
+	layer_0_b -> layer_0 [style=invis];
+	layer_0 -> layer_0_a [style=invis];
+	
+	/* States */
+	Agent_end_Agent [label = "end_Agent"]
+	Agent_start_Agent [label = "start_Agent"]
+	
+	/* Functions */
+	Agent_set_xy_start_Agent_end_Agent [label = "set_xy", shape = rect]
+	
+	/* Message types */
+	
+	/* Transitions */
+	Agent_start_Agent -> Agent_set_xy_start_Agent_end_Agent;
+	Agent_set_xy_start_Agent_end_Agent -> Agent_end_Agent;
+	
+	/* Communications */
+	{ rank=same; layer_0;  Agent_set_xy_start_Agent_end_Agent; }
+	{ rank=same; layer_0_b; }
+	{ rank=same; layer_0_a; }
+}

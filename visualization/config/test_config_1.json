@@ -1,0 +1,33 @@
+{
+    "comparison_sets": [
+        "set_1",
+        "set_2"
+    ],
+    "time_variable": "_ITERATION_NO",
+    "plots": [
+        {
+            "plot_style": "time_series",
+            "agent_type": "Agent",
+            "variable_name": "x",
+            "output_filename": "agent_x_set_12.png"
+        },
+        {
+            "plot_style": "time_series",
+            "agent_type": "Agent",
+            "variable_name": "y",
+            "output_filename": "agent_y_set_12.png"
+        },
+        {
+            "plot_style": "scatter_plot",
+            "agent_type": "Agent",
+            "variable_name": "x",
+            "secondary_variable": "y",
+            "target_iteration": {
+                "start": 1,
+                "stop": 640,
+                "step": 1
+            },
+            "output_filename": "agent_x_y_scatter_set_12.png"
+        }
+    ]
+}
