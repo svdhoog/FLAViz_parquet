@@ -24,7 +24,7 @@ LD       = $(SERIAL_LOADER)
 
 # Compilation Flags (Included -I. so generated source files can find parquet_engine.h)
 CFLAGS   = -I$(LIBMBOARD_INC) -I. $(DEFINES) -fcommon -Wall
-CXXFLAGS = -I$(LIBMBOARD_INC) -I. $(DEFINES) -Wall -std=c++17
+CXXFLAGS = -I$(LIBMBOARD_INC) -I. $(DEFINES) -Wall -std=c++20
 
 
 CFLAGS   += -std=c11 -D_DEBUG_MODE -g

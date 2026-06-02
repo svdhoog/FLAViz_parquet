@@ -5,6 +5,9 @@
 extern "C" {
 #endif
 
+// Global variable to hold the directory path of the initial XML file (this is where parquet files are written out)
+extern char parquet_output_directory[512];
+
 // Allocates a new row record with identity metadata before streaming its variables
 void parquet_start_row(const char* agent_name, int iteration, long id);
 

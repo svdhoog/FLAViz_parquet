@@ -6,8 +6,16 @@ SQL to Parquet Hierarchical Dataset Converter (With Auto-Numeric Casting)
 Description:
     Recursively travels down an input folder tree to locate simulation database
     files (.db, .sqlite, .sqlite3), extracts each internal table as a distinct 
-    agent data set, and mirrors the entire folder hierarchy into an isolated,
+    agent data set, and mirrors the folder hierarchy into an isolated,
     parallel target directory using compressed Apache Parquet format.
+
+    Supports both hierarchical input layouts:
+      - root_folder/set_x/run_y/any_name.db
+    And legacy flat layout files:
+      - root_folder/set_x_run_y_[optional_suffix].db
+
+    Both formats are standardized into the clean target structure:
+      - root_output_dir/set_x/run_y/data_[table_name].parquet
 
     Automatically detects text-encoded (VARCHAR) numeric columns inherited from
     legacy FLAME loggers and converts them to true numeric types on disk.
@@ -21,11 +29,25 @@ Usage Syntax:
 """
 
 import os
+import re
 import argparse
 from sqlalchemy import create_engine, inspect
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+def parse_legacy_flat_filename(filename):
+    """
+    Checks if a filename matches the legacy flat structure (e.g., set_x_run_y_anything.db).
+    Returns a relative subpath tuple (set_x, run_y) if matched, otherwise None.
+    """
+    # Captures 'set_' and 'run_' blocks dynamically. Any trailing characters 
+    # before the extension (like '_output', '_sim', etc.) are safely ignored.
+    pattern = r'^(set_[a-zA-Z0-9]+)_(run_[a-zA-Z0-9]+)(?:_.*)?\.(?:db|sqlite|sqlite3)$'
+    match = re.match(pattern, filename, re.IGNORECASE)
+    if match:
+        return match.group(1), match.group(2)
+    return None
 
 def convert_sqlite_to_parquet(db_path, root_input_dir, root_output_dir):
     """
@@ -37,20 +59,39 @@ def convert_sqlite_to_parquet(db_path, root_input_dir, root_output_dir):
     input_dir_abs = os.path.abspath(root_input_dir)
     output_dir_abs = os.path.abspath(root_output_dir)
     
+    filename = os.path.basename(db_abs_path)
     current_db_dir = os.path.dirname(db_abs_path)
-    rel_subpath = os.path.relpath(current_db_dir, input_dir_abs)
-    target_output_dir = os.path.normpath(os.path.join(output_dir_abs, rel_subpath))
+    
+    # Check if the filename itself contains the legacy flat structure info
+    legacy_components = parse_legacy_flat_filename(filename)
+    
+    if legacy_components:
+        # Flat structure: map set_x_run_y_anything.db -> root_output_dir/set_x/run_y/
+        set_dir, run_dir = legacy_components
+        
+        # Determine if the database file was inside any extra subdirectories relative to input root
+        rel_parent_dir = os.path.relpath(current_db_dir, input_dir_abs)
+        if rel_parent_dir == '.':
+            target_output_dir = os.path.normpath(os.path.join(output_dir_abs, set_dir, run_dir))
+            rel_subpath = os.path.join(set_dir, run_dir)
+        else:
+            target_output_dir = os.path.normpath(os.path.join(output_dir_abs, rel_parent_dir, set_dir, run_dir))
+            rel_subpath = os.path.join(rel_parent_dir, set_dir, run_dir)
+    else:
+        # Standard structured layout: mirror the directory tree directly
+        rel_subpath = os.path.relpath(current_db_dir, input_dir_abs)
+        target_output_dir = os.path.normpath(os.path.join(output_dir_abs, rel_subpath))
     
     engine = create_engine(f"sqlite:///{db_abs_path}")
     inspector = inspect(engine)
     table_names = inspector.get_table_names()
     
     if not table_names:
-        print(f"  [Skipped] No tables found inside: {os.path.basename(db_path)}")
+        print(f"  [Skipped] No tables found inside: {filename}")
         engine.dispose()
         return
 
-    print(f"  Processing {os.path.basename(db_path)}:")
+    print(f"  Processing {filename}:")
     
     for table_name in table_names:
         df = pd.read_sql_table(table_name, con=engine)
@@ -60,27 +101,19 @@ def convert_sqlite_to_parquet(db_path, root_input_dir, root_output_dir):
 
         # --- AUTO-CASTING LOGIC: Fix VARCHAR-encoded numbers ---
         for col in df.columns:
-            # Check if column is stored as text/object type
             if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-                # Strip potential whitespace
                 stripped_col = df[col].astype(str).str.strip()
-                
-                # Check if the non-empty rows are purely numeric
-                # (Handles both integers and floating points)
                 sample = stripped_col[stripped_col != '']
                 if not sample.empty and sample.str.match(r'^-?\d+(?:\.\d+)?$').all():
-                    # Attempt safe dynamic conversion to numeric
-                    # 'coerce' turns invalid entries to NaN safely
                     converted = pd.to_numeric(df[col], errors='coerce')
-                    
-                    # If conversion succeeded without losing the whole column, commit it
                     if not converted.isna().all():
                         df[col] = converted
                         print(f"    * Auto-cast column '{col}' in table '{table_name}' from VARCHAR to Numeric")
         
-        # Convert the cleaned, optimized dataframe to an immutable Apache Arrow Table
+        # Convert to an immutable Apache Arrow Table
         arrow_table = pa.Table.from_pandas(df)
         
+        # Consistent filename schema mapping to data_[table_name].parquet
         parquet_filename = f"data_{table_name}.parquet"
         parquet_path = os.path.join(target_output_dir, parquet_filename)
         
@@ -158,3 +191,4 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     traverse_and_transform(args.input, args.output)
+    

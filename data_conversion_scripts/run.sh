@@ -1,6 +1,7 @@
 #!/bin/bash
 
-#python sql_to_parquet.py --input ./legacy_sql_runs --output ./parquet_mirror
+# Usage:
+# python sql_to_parquet.py --input ./legacy_sql_runs --output ./parquet_mirror
 
 #Circles test model
 #INPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/test_data/input/sql'
