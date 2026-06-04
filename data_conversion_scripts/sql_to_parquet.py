@@ -1,194 +1,188 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-SQL to Parquet Hierarchical Dataset Converter (With Auto-Numeric Casting)
+SQL to Parquet Hierarchical Dataset Converter (Production Parallel Version)
 ================================================================================
 Description:
-    Recursively travels down an input folder tree to locate simulation database
-    files (.db, .sqlite, .sqlite3), extracts each internal table as a distinct 
-    agent data set, and mirrors the folder hierarchy into an isolated,
-    parallel target directory using compressed Apache Parquet format.
-
-    Supports both hierarchical input layouts:
-      - root_folder/set_x/run_y/any_name.db
-    And legacy flat layout files:
-      - root_folder/set_x_run_y_[optional_suffix].db
-
-    Both formats are standardized into the clean target structure:
-      - root_output_dir/set_x/run_y/data_[table_name].parquet
-
-    Automatically detects text-encoded (VARCHAR) numeric columns inherited from
-    legacy FLAME loggers and converts them to true numeric types on disk.
-
-Prerequisites / Dependencies:
-    $ pip install pandas pyarrow sqlalchemy
+    Recursively converts legacy SQLite simulation outputs into a mirrored 
+    compressed Apache Parquet hierarchy using a parallel, fault-tolerant worker 
+    pool. Features include safe keyboard interrupt termination, incremental up-to-date 
+    skipping logic, and system memory leak protections.
 
 Usage Syntax:
-    $ python sql_to_parquet.py --input ./legacy_sql_runs --output ./parquet_mirror
+    $ python sql_to_parquet.py --input ./legacy_sql_runs \\
+        --output ./parquet_mirror --sets 1-513 --runs 1-1000 --force
+
+Command-Line Arguments & Flags:
+    -i, --input    [Required] Top-level folder containing the legacy simulation
+                              database hierarchy.
+    -o, --output   [Optional] Target folder where the parallel mirrored Parquet
+                              hierarchy will be generated.
+                              Default: "./parquet_mirror_output"
+    --sets         [Optional] Inclusive range of sets to process (e.g., 1-5).
+    --runs         [Optional] Inclusive range of runs to process (e.g., 1-1000).
+    -w, --workers  [Optional] Number of parallel process workers to spawn.
+                              Default: Host logical core count.
+    --force        [Optional] Overwrite existing targets, disabling skipping
+                              logic optimization.
 ================================================================================
 """
 
 import os
 import re
+import sys
+import signal
 import argparse
+import multiprocessing
 from sqlalchemy import create_engine, inspect
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+def init_worker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+def parse_range_arg(range_str):
+    if not range_str:
+        return None
+    match = re.match(r'^(\d+)-(\d+)$', range_str.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(f"Range format must be 'start-end' (e.g. 1-5). Got: '{range_str}'")
+    start, end = int(match.group(1)), int(match.group(2))
+    if start > end:
+        raise argparse.ArgumentTypeError(f"Invalid range: start ({start}) cannot exceed end ({end}).")
+    return (start, end)
+
+def is_in_range(value_str, range_tuple):
+    if range_tuple is None:
+        return True
+    match = re.search(r'\d+', value_str)
+    if not match:
+        return False
+    return range_tuple[0] <= int(match.group()) <= range_tuple[1]
+
 def parse_legacy_flat_filename(filename):
-    """
-    Checks if a filename matches the legacy flat structure (e.g., set_x_run_y_anything.db).
-    Returns a relative subpath tuple (set_x, run_y) if matched, otherwise None.
-    """
-    # Captures 'set_' and 'run_' blocks dynamically. Any trailing characters 
-    # before the extension (like '_output', '_sim', etc.) are safely ignored.
     pattern = r'^(set_[a-zA-Z0-9]+)_(run_[a-zA-Z0-9]+)(?:_.*)?\.(?:db|sqlite|sqlite3)$'
     match = re.match(pattern, filename, re.IGNORECASE)
     if match:
         return match.group(1), match.group(2)
     return None
 
-def convert_sqlite_to_parquet(db_path, root_input_dir, root_output_dir):
-    """
-    Connects to a single SQLite database file, extracts all tables, optimizes
-    column text-to-numeric data types, and saves each table as a compressed Parquet
-    file inside a mirrored parallel output directory structure.
-    """
-    db_abs_path = os.path.abspath(db_path)
-    input_dir_abs = os.path.abspath(root_input_dir)
-    output_dir_abs = os.path.abspath(root_output_dir)
+def convert_single_sqlite_to_parquet(task_args):
+    db_path, root_input, root_output, set_range, run_range, overwrite_flag = task_args
     
-    filename = os.path.basename(db_abs_path)
-    current_db_dir = os.path.dirname(db_abs_path)
-    
-    # Check if the filename itself contains the legacy flat structure info
-    legacy_components = parse_legacy_flat_filename(filename)
-    
-    if legacy_components:
-        # Flat structure: map set_x_run_y_anything.db -> root_output_dir/set_x/run_y/
-        set_dir, run_dir = legacy_components
+    try:
+        db_abs = os.path.abspath(db_path)
+        filename = os.path.basename(db_abs)
+        current_dir = os.path.dirname(db_abs)
         
-        # Determine if the database file was inside any extra subdirectories relative to input root
-        rel_parent_dir = os.path.relpath(current_db_dir, input_dir_abs)
-        if rel_parent_dir == '.':
-            target_output_dir = os.path.normpath(os.path.join(output_dir_abs, set_dir, run_dir))
-            rel_subpath = os.path.join(set_dir, run_dir)
+        legacy_components = parse_legacy_flat_filename(filename)
+        if legacy_components:
+            set_dir, run_dir = legacy_components
+            rel_parent = os.path.relpath(current_dir, os.path.abspath(root_input))
+            target_out = os.path.normpath(os.path.join(root_output, rel_parent, set_dir, run_dir)) if rel_parent != '.' else os.path.normpath(os.path.join(root_output, set_dir, run_dir))
         else:
-            target_output_dir = os.path.normpath(os.path.join(output_dir_abs, rel_parent_dir, set_dir, run_dir))
-            rel_subpath = os.path.join(rel_parent_dir, set_dir, run_dir)
-    else:
-        # Standard structured layout: mirror the directory tree directly
-        rel_subpath = os.path.relpath(current_db_dir, input_dir_abs)
-        target_output_dir = os.path.normpath(os.path.join(output_dir_abs, rel_subpath))
-    
-    engine = create_engine(f"sqlite:///{db_abs_path}")
-    inspector = inspect(engine)
-    table_names = inspector.get_table_names()
-    
-    if not table_names:
-        print(f"  [Skipped] No tables found inside: {filename}")
-        engine.dispose()
-        return
+            rel_subpath = os.path.relpath(current_dir, os.path.abspath(root_input))
+            target_out = os.path.normpath(os.path.join(root_output, rel_subpath))
+        
+        if not overwrite_flag and os.path.exists(target_out):
+            if any(f.endswith('.parquet') for f in os.listdir(target_out) if os.path.isfile(os.path.join(target_out, f))):
+                return "SKIPPED"
 
-    print(f"  Processing {filename}:")
-    
-    for table_name in table_names:
-        df = pd.read_sql_table(table_name, con=engine)
+        engine = create_engine(f"sqlite:///{db_abs}")
+        inspector = inspect(engine)
+        table_names = inspector.get_table_names()
         
-        if df.empty:
-            continue
+        if not table_names:
+            engine.dispose()
+            return "EMPTY"
+        
+        os.makedirs(target_out, exist_ok=True)
+        
+        for table_name in table_names:
+            df = pd.read_sql_table(table_name, con=engine)
+            if df.empty:
+                continue
 
-        # --- AUTO-CASTING LOGIC: Fix VARCHAR-encoded numbers ---
-        for col in df.columns:
-            if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-                stripped_col = df[col].astype(str).str.strip()
-                sample = stripped_col[stripped_col != '']
-                if not sample.empty and sample.str.match(r'^-?\d+(?:\.\d+)?$').all():
-                    converted = pd.to_numeric(df[col], errors='coerce')
-                    if not converted.isna().all():
-                        df[col] = converted
-                        print(f"    * Auto-cast column '{col}' in table '{table_name}' from VARCHAR to Numeric")
-        
-        # Convert to an immutable Apache Arrow Table
-        arrow_table = pa.Table.from_pandas(df)
-        
-        # Consistent filename schema mapping to data_[table_name].parquet
-        parquet_filename = f"data_{table_name}.parquet"
-        parquet_path = os.path.join(target_output_dir, parquet_filename)
-        
-        if not os.path.exists(target_output_dir):
-            os.makedirs(target_output_dir)
+            for col in df.columns:
+                if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
+                    stripped_col = df[col].astype(str).str.strip()
+                    sample = stripped_col[stripped_col != '']
+                    if not sample.empty and sample.str.match(r'^-?\d+(?:\.\d+)?$').all():
+                        converted = pd.to_numeric(df[col], errors='coerce')
+                        if not converted.isna().all():
+                            df[col] = converted
             
-        pq.write_table(arrow_table, parquet_path, compression='SNAPPY')
-        print(f"    -> Extracted table '{table_name}' into mirror: .../{rel_subpath}/{parquet_filename}")
-        
-    engine.dispose()
+            arrow_table = pa.Table.from_pandas(df)
+            pq.write_table(arrow_table, os.path.join(target_out, f"data_{table_name}.parquet"), compression='SNAPPY')
+            
+        engine.dispose()
+        return "CONVERTED"
+    except Exception as e:
+        return f"ERROR: {e}"
 
-def count_database_files(root_input_dir, extensions):
-    """Scans the directory tree beforehand to determine the total number of DB files."""
-    count = 0
-    for root, _, files in os.walk(root_input_dir):
-        for file in files:
-            if file.endswith(extensions):
-                count += 1
-    return count
-
-def traverse_and_transform(root_input_dir, root_output_dir):
-    """Recursively converts hierarchical SQLite database files to typed Parquet structures."""
-    if not os.path.exists(root_input_dir):
-        print(f"[FATAL ERROR] The specified input folder '{root_input_dir}' does not exist.")
-        return
-
-    db_extensions = ('.db', '.sqlite', '.sqlite3')
-    total_files = count_database_files(root_input_dir, db_extensions)
-    
-    print(f"Starting parallel batch transformation\n" + "="*70)
-    print(f"Source Root: {os.path.abspath(root_input_dir)}")
-    print(f"Target Mirror Root: {os.path.abspath(root_output_dir)}")
-    print(f"Total Database Files Found: {total_files}")
-    print("="*70)
-    
-    if total_files == 0:
-        print("No target database files detected to transform.")
-        return
-
-    processed_count = 0
-    total_converted = 0
-    
-    for root, dirs, files in os.walk(root_input_dir):
-        for file in files:
-            if file.endswith(db_extensions):
-                full_db_path = os.path.join(root, file)
-                processed_count += 1
-                
-                progress_percentage = (processed_count / total_files) * 100
-                rel_path = os.path.relpath(full_db_path, root_input_dir)
-                print(f"\n[{progress_percentage:6.2f}%] [Found Database {processed_count}/{total_files}] {rel_path}")
-                
-                try:
-                    convert_sqlite_to_parquet(full_db_path, root_input_dir, root_output_dir)
-                    total_converted += 1
-                except Exception as e:
-                    print(f"  [ERROR] Failed processing {file}. Reason: {e}")
-                    
-    print("\n" + "="*70 + f"\nTransformation complete! Successfully processed {total_converted} database clusters.")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Extract tables from a hierarchical SQLite tree and mirror it into a parallel Parquet dataset tree with automatic type casting."
-    )
-    parser.add_argument(
-        '-i', '--input', 
-        required=True, 
-        help="Top-level folder containing the legacy simulation database hierarchy."
-    )
-    parser.add_argument(
-        '-o', '--output', 
-        default="./parquet_mirror_output", 
-        help="Target folder where the parallel mirrored Parquet hierarchy will be generated."
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Production Parallel SQL to Parquet pipeline configuration.")
+    parser.add_argument('-i', '--input', required=True, help="Top-level folder containing the legacy simulation database hierarchy.")
+    parser.add_argument('-o', '--output', default="./parquet_mirror_output", help="Target folder where the parallel mirrored Parquet hierarchy will be generated.")
+    parser.add_argument('--sets', type=parse_range_arg, help="Inclusive range of sets to process (e.g., 1-5)")
+    parser.add_argument('--runs', type=parse_range_arg, help="Inclusive range of runs to process (e.g., 1-1000)")
+    parser.add_argument('-w', '--workers', type=int, default=multiprocessing.cpu_count(), help="Number of parallel process workers to spawn (defaults to host logical core count).")
+    parser.add_argument('--force', action='store_true', help="Overwrite existing targets, disabling skipping logic optimization.")
     
     args = parser.parse_args()
-    traverse_and_transform(args.input, args.output)
     
+    if not os.path.exists(args.input):
+        print(f"[FATAL] Root path '{args.input}' does not exist.")
+        sys.exit(1)
+        
+    print("Scoping filesystem files matching bounds...")
+    db_exts = ('.db', '.sqlite', '.sqlite3')
+    task_queue = []
+    
+    for root, _, files in os.walk(args.input):
+        for file in files:
+            if file.endswith(db_exts):
+                legacy_components = parse_legacy_flat_filename(file)
+                if legacy_components:
+                    if not is_in_range(legacy_components[0], args.sets) or not is_in_range(legacy_components[1], args.runs):
+                        continue
+                else:
+                    rel_sub = os.path.relpath(root, args.input)
+                    parts = rel_sub.replace("\\", "/").split("/")
+                    set_p = [p for p in parts if re.match(r'^set_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
+                    run_p = [p for p in parts if re.match(r'^run_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
+                    if set_p and not is_in_range(set_p[-1], args.sets): continue
+                    if run_p and not is_in_range(run_p[-1], args.runs): continue
+                
+                task_queue.append((os.path.join(root, file), args.input, args.output, args.sets, args.runs, args.force))
+
+    total_jobs = len(task_queue)
+    print(f"Queue established. Found {total_jobs} active targets configuration. Initializing system execution workers...")
+    
+    stats = {"CONVERTED": 0, "SKIPPED": 0, "EMPTY": 0, "ERROR": 0}
+    
+    with multiprocessing.Pool(processes=args.workers, initializer=init_worker, maxtasksperchild=200) as pool:
+        try:
+            results = pool.imap_unordered(convert_single_sqlite_to_parquet, task_queue, chunksize=10)
+            for idx, res in enumerate(results, 1):
+                if res.startswith("ERROR"):
+                    stats["ERROR"] += 1
+                    print(f"\n  [Worker Alert] {res}")
+                else:
+                    stats[res] += 1
+                
+                if idx % max(1, total_jobs // 50) == 0 or idx == total_jobs:
+                    print(f" -> Progression: [{idx}/{total_jobs}] ({.2f}%) Complete. (Converted: {stats['CONVERTED']} | Skipped: {stats['SKIPPED']})", flush=True)
+        except KeyboardInterrupt:
+            print("\n[CRITICAL ALERT] User sent interrupt via termination control (Ctrl+C). Cleaning context matrices and shutting down pools...")
+            pool.terminate()
+            pool.join()
+            print("System components cleared safely.")
+            sys.exit(130)
+
+    print(f"\nExecution finished.\n -> Converted: {stats['CONVERTED']}\n -> Skipped: {stats['SKIPPED']}\n -> Errors/Failed: {stats['ERROR']}")
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
