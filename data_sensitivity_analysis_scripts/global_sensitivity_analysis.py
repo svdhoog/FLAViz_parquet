@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Global Sensitivity Analysis (GSA) & Bifurcation Mapping Module
+Global Sensitivity Analysis (GSA) & Memory-Safe Bifurcation Engine
 ================================================================================
 Description:
-    Processes large mirrored Parquet files using a highly parallel framework to 
-    construct empirical bifurcation diagrams. Instead of aggressively averaging 
-    dynamics down to a single point, this module maps every iteration of every 
-    run directly against the parameter continuum.
+    Processes large mirrored Parquet files using a memory-capped parallel 
+    framework to construct empirical bifurcation diagrams. 
 
-    Supports rendering low-opacity monochrome structures, color-mapped probability 
-    density fields, or executing both layouts simultaneously to track phase 
-    transitions, stable attractors, and chaotic splits.
+    Features iteration downsampling (striding) to prevent Out-of-Memory (OOM) 
+    crashes on systems processing massive high-frequency simulation runs.
 ================================================================================
 """
 
@@ -90,17 +87,19 @@ def load_parameter_design(csv_path, set_range):
     return df, param_names
 
 def read_single_parquet_raw_stream(task_args):
-    file_path, set_id, run_id, single_metric = task_args
+    file_path, set_id, run_id, single_metric, stride = task_args
     try:
         data_table = pq.read_table(file_path, columns=[single_metric])
         if data_table.num_rows == 0:
             return None
-        y_values = data_table.column(single_metric).to_numpy()
+        
+        # MEMORY FIX 1: Downsample the array steps directly during load extraction
+        y_values = data_table.column(single_metric).to_numpy()[::stride]
         return {'set_id': set_id, 'y': y_values}
     except Exception:
         return None
 
-def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_workers):
+def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_workers, stride):
     target_file = f"data_{table_name}.parquet"
     scan_queue = []
     
@@ -112,7 +111,8 @@ def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_w
             
             if set_match and run_match:
                 if is_in_range(set_match[-1], set_range) and is_in_range(run_match[-1], run_range):
-                    scan_queue.append((os.path.join(root, target_file), set_match[-1], run_match[-1], metric))
+                    # Pass stride down to the worker tracking arguments
+                    scan_queue.append((os.path.join(root, target_file), set_match[-1], run_match[-1], metric, stride))
                     
     total_targets = len(scan_queue)
     if total_targets == 0:
@@ -134,10 +134,9 @@ def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_w
     return pd.DataFrame({'set_id': flat_set_ids, metric: flat_y_values})
 
 # ================================================================================
-# DIAGNOSTIC PLOTTING PLUGINS
+# RENDERING PLUGINS
 # ================================================================================
 def plot_bifurcation_greyscale(df_merged, parameter_columns, target_metric, save_path):
-    """Monochrome engine capitalizing on high-density alpha-blending."""
     num_params = len(parameter_columns)
     cols = 4
     rows = (num_params + cols - 1) // cols
@@ -148,8 +147,9 @@ def plot_bifurcation_greyscale(df_merged, parameter_columns, target_metric, save
     print(f" -> Rendering low-opacity monochrome scatter canvas...")
     
     for i, col in enumerate(parameter_columns):
+        # Slightly adjusted s and alpha to look great with downsampled arrays
         axes[i].scatter(df_merged[col], df_merged[target_metric], 
-                        alpha=0.01, s=0.05, color='#111111', rasterized=True)
+                        alpha=0.03, s=0.1, color='#111111', rasterized=True)
         
         axes[i].set_title(f'{col}', fontsize=11)
         axes[i].set_ylabel(target_metric if i % cols == 0 else '')
@@ -160,7 +160,7 @@ def plot_bifurcation_greyscale(df_merged, parameter_columns, target_metric, save
         
     title_text = (
         f"Simulation Empirical Bifurcation Diagram (Monochrome Vector Mapping)\n"
-        f"Target Metric: {target_metric} (All Iterations & Runs Plotted)"
+        f"Target Metric: {target_metric} (Downsampled Iterations Plotted)"
     )
     plt.suptitle(title_text, fontsize=14, y=0.98)
     plt.tight_layout()
@@ -169,7 +169,6 @@ def plot_bifurcation_greyscale(df_merged, parameter_columns, target_metric, save
 
 
 def plot_bifurcation_color(df_merged, parameter_columns, target_metric, save_path):
-    """Color engine mapping localized 2D histogram bins to a logarithmic colormap."""
     num_params = len(parameter_columns)
     cols = 4
     rows = (num_params + cols - 1) // cols
@@ -196,7 +195,7 @@ def plot_bifurcation_color(df_merged, parameter_columns, target_metric, save_pat
         
         last_scatter = axes[i].scatter(x_sort, y_sort, c=d_sort, cmap='inferno', 
                                        norm=LogNorm(vmin=1, vmax=max(2, densities.max())),
-                                       s=0.15, alpha=0.4, rasterized=True)
+                                       s=0.2, alpha=0.5, rasterized=True)
         
         axes[i].set_title(f'{col}', fontsize=11)
         axes[i].set_ylabel(target_metric if i % cols == 0 else '')
@@ -211,7 +210,7 @@ def plot_bifurcation_color(df_merged, parameter_columns, target_metric, save_pat
         
     title_text = (
         f"Simulation Empirical Bifurcation Topology Map (Probability Density Colorized)\n"
-        f"Target Metric: {target_metric} (All Iterations & Runs Plotted)"
+        f"Target Metric: {target_metric} (Downsampled Iterations Plotted)"
     )
     plt.suptitle(title_text, fontsize=14, y=0.98)
     plt.tight_layout(rect=[0, 0, 0.95, 1.0])
@@ -219,24 +218,26 @@ def plot_bifurcation_color(df_merged, parameter_columns, target_metric, save_pat
     plt.close()
 
 # ================================================================================
-# EXECUTION COUPLING
+# RUN EXECUTION
 # ================================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Parallel Bifurcation Space Extraction Engine.")
+    parser = argparse.ArgumentParser(description="Memory-Safe Parallel Bifurcation Space Engine.")
     parser.add_argument('-i', '--input', required=True, help="Path to the mirrored Parquet folder root.")
     parser.add_argument('-p', '--parameters', required=True, help="Path to CSV parameters file.")
     parser.add_argument('-t', '--table', required=True, help="Name of the inner agent database table.")
-    parser.add_argument('-m', '--metric', required=True, nargs='+', type=parse_metrics_arg,
-                        help="Target performance metrics. Supports [a,b,c] or space-separated lists.")
-    
-    # MODIFIED: Added 'color-and-greyscale' option choice
-    parser.add_argument('-s', '--style', choices=['color', 'greyscale', 'color-and-greyscale'], default='color',
-                        help="Visual styling format engine used for rendering diagrams (default: color).")
-    
+    parser.add_argument('-m', '--metric', required=True, nargs='+', type=parse_metrics_arg)
+    parser.add_argument('-s', '--style', choices=['color', 'greyscale', 'color-and-greyscale'], default='color')
     parser.add_argument('-o', '--output', default=None, help="Output destination root folder.")
     parser.add_argument('--sets', type=parse_range_arg)
+    
+    # MEMORY FIX 3: Restrict this in your run command execution (e.g. --runs 1-200)
     parser.add_argument('--runs', type=parse_range_arg)
+    
+    # MEMORY FIX 2: Lower worker count in command execution (e.g. --workers 1 or --workers 2)
     parser.add_argument('-w', '--workers', type=int, default=multiprocessing.cpu_count())
+    
+    # OPTIONAL TUNING STRIDE: Keep every N-th data step
+    parser.add_argument('--stride', type=int, default=5, help="Take every N-th time step step to save memory (default: 5).")
     
     args = parser.parse_args()
     
@@ -256,8 +257,8 @@ def main():
         dir_name = os.path.dirname(os.path.abspath(args.output)) if args.output else "./"
 
         for metric in metrics_list:
-            print(f"\n[*] Processing data vector blocks for target metric: '{metric}'...")
-            df_outputs = stream_metric_data(args.input, args.table, metric, args.sets, args.runs, args.workers)
+            print(f"\n[*] Processing data vector blocks for target metric: '{metric}' (Stride: {args.stride})...")
+            df_outputs = stream_metric_data(args.input, args.table, metric, args.sets, args.runs, args.workers, args.stride)
             df_outputs['set_id'] = df_outputs['set_id'].apply(format_set_id)
             
             print(f"[*] Merging parameters with tracking arrays...")
@@ -271,7 +272,6 @@ def main():
             if not os.path.exists(metric_subfolder):
                 os.makedirs(metric_subfolder)
             
-            # MODIFIED: Control plot processing paths via string matching to support simultaneous multi-rendering outputs
             if args.style in ['color', 'color-and-greyscale']:
                 save_dest_color = os.path.join(metric_subfolder, f'gsa_behavior_grid_{metric}_color.png')
                 plot_bifurcation_color(df_merged, verified_cols, metric, save_dest_color)
@@ -283,7 +283,7 @@ def main():
             del df_outputs
             del df_merged
 
-        print(f"\n[+] GSA Execution pipeline completed successfully using style flag: '{args.style}'.")
+        print(f"\n[+] Safe execution pipeline completed successfully using style flag: '{args.style}'.")
         
     except Exception as err:
         print(f"\n[FATAL ERROR] {err}")
