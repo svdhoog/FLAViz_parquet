@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-FLAViz Data Pipeline Inspector (Dynamic Column Alignment Mode)
+FLAViz Data Pipeline Inspector (Dynamic Range & Column Alignment Mode)
 ================================================================================
 Description:
     Recursively scans a hierarchical Parquet tree to provide architectural 
@@ -13,25 +13,81 @@ Description:
     and stripping structural index properties like '_ITERATION_NO' from schemas.
     Dynamically sizes column spaces to prevent overlap on long variable names.
 
-Dependencies:
-    $ pip install duckdb
+    Supports targeted subset profiling via range constraints on sets and runs.
 
-Usage Syntax:
+Command Line Arguments (argparse):
+    -i, --input  (Required) : Path leading to the top-level mirrored Parquet 
+                             directory hierarchy.
+    -o, --output (Optional) : File path/name destination to write a summary 
+                             report file instead of printing to the terminal.
+    --sets       (Optional) : Target parameter subset range index limit block 
+                             selection rule. Fully inclusive. (e.g., '1-256' or '12').
+    --runs       (Optional) : Target stochastic simulation run count boundary 
+                             rule constraints. Fully inclusive. (e.g., '1-500' or '1000').
+
+Usage Syntax Examples:
+    $ python flaviz_inspect.py -i ./parquet_mirror_output
     $ python flaviz_inspect.py -i ./parquet_mirror_output -o ./summary.txt
+    $ python flaviz_inspect.py -i ./parquet_mirror_output --sets 1-256 --runs 1-500
 ================================================================================
 """
 
 import os
 import sys
+import re
 import argparse
 import duckdb
 
 class ParquetDatasetInspector:
-    def __init__(self, root_dir, output_file=None):
+    def __init__(self, root_dir, output_file=None, sets_range=None, runs_range=None):
         self.root_dir = os.path.abspath(root_dir)
         self.conn = duckdb.connect()
         self.output_file = output_file
+        self.sets_filter = self._parse_range_string(sets_range)
+        self.runs_filter = self._parse_range_string(runs_range)
         self._output_buffer = []
+
+    def _parse_range_string(self, range_str):
+        """
+        Parses strings like '1-256', '5', or '100-200' into a set of integers.
+        Returns None if no range string is provided, implying no constraint.
+        """
+        if not range_str:
+            return None
+        
+        allowed_indices = set()
+        # Match a single number or a bounding range block
+        pattern = re.compile(r'^(\d+)(?:-(\d+))?$')
+        match = pattern.match(str(range_str).strip())
+        
+        if not match:
+            print(f"[FATAL ERROR] Invalid range constraint expression: '{range_str}'")
+            print("Please use standard formatting integers or boundary bounds (e.g., '5' or '1-256').")
+            sys.exit(1)
+            
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else start
+        
+        if start > end:
+            start, end = end, start
+            
+        return set(range(start, end + 1))
+
+    def _should_include(self, entry_name, filter_set):
+        """
+        Extracts the numeric suffix identifier from directory names like 
+        'set_513' or 'run_1000' and evaluates it against target range limits.
+        """
+        if filter_set is None:
+            return True
+            
+        # Extract trailing digits using a generic regular expression match
+        num_match = re.search(r'(\d+)$', entry_name)
+        if not num_match:
+            return False # Skip directories lacking structured numeric indexing definitions
+            
+        idx_val = int(num_match.group(1))
+        return idx_val in filter_set
 
     def log(self, text=""):
         """Buffers text lines to output to file or terminal dynamically."""
@@ -62,16 +118,19 @@ class ParquetDatasetInspector:
         self.log("=" * 80)
         self.log("FLAVIZ DATASET ARCHITECTURE REPORT")
         self.log(f"Target Directory: {self.root_dir}")
+        if self.sets_filter or self.runs_filter:
+            self.log(f"Scope Filters: Sets Filter={bool(self.sets_filter)} | Runs Filter={bool(self.runs_filter)}")
         self.log("=" * 80)
 
-        # 1. Detect Parameter Sets (Top-level Subdirectories)
-        subdirs = [d for d in os.listdir(self.root_dir) if os.path.isdir(os.path.join(self.root_dir, d))]
+        # 1. Detect and Filter Parameter Sets (Top-level Subdirectories)
+        all_subdirs = [d for d in os.listdir(self.root_dir) if os.path.isdir(os.path.join(self.root_dir, d))]
+        subdirs = [d for d in all_subdirs if self._should_include(d, self.sets_filter)]
+        
         if not subdirs:
-            print("[FATAL ERROR] No parameter sets or subdirectories found in the target root.")
-            print("Verify that your folder tree structure fits a [Parameter_Set]/[Run_Seed] layout configuration.")
+            print("[FATAL ERROR] No matching parameter sets or subdirectories found under provided range guidelines.")
             sys.exit(1)
 
-        self.log(f"\n[+] Parameter Sets Detected ({len(subdirs)} total):")
+        self.log(f"\n[+] Parameter Sets Filtered & Selected ({len(subdirs)} of {len(all_subdirs)} total):")
         for s in sorted(subdirs):
             self.log(f"    - {s}")
 
@@ -85,19 +144,20 @@ class ParquetDatasetInspector:
         for p_set in sorted(subdirs):
             p_set_path = os.path.join(self.root_dir, p_set)
             
-            # 2. Count Stochastic Monte Carlo Runs per set
-            runs = [r for r in os.listdir(p_set_path) if os.path.isdir(os.path.join(p_set_path, r))]
+            # 2. Count and Filter Stochastic Monte Carlo Runs per set
+            all_runs = [r for r in os.listdir(p_set_path) if os.path.isdir(os.path.join(p_set_path, r))]
+            runs = [r for r in all_runs if self._should_include(r, self.runs_filter)]
             global_run_count += len(runs)
             
             self.log(f"\n* Parameter Set: {p_set}")
-            self.log(f"  └── Total Monte Carlo Runs (Seeds): {len(runs)}")
+            self.log(f"  └── Matching Monte Carlo Runs (Seeds): {len(runs)} (out of {len(all_runs)} total)")
 
             if not runs:
-                self.log("  └── [Warning] No run folders located inside this set.")
+                self.log("  └── [Warning] No run folders matching constraint located inside this set.")
                 continue
 
-            # Target the first available run to inspect internal table file structures
-            sample_run_path = os.path.join(p_set_path, runs[0])
+            # Target the first available run matching range selection criteria to check file schemas
+            sample_run_path = os.path.join(p_set_path, sorted(runs)[0])
             parquet_files = [f for f in os.listdir(sample_run_path) if f.endswith('.parquet')]
             
             # Filter file names immediately to exclude non-agent files and metadata placeholders
@@ -182,7 +242,7 @@ class ParquetDatasetInspector:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Inspect and profile your FLAME Parquet simulation schema metrics."
+        description="Inspect and profile your FLAME Parquet simulation schema metrics with range control limits."
     )
     parser.add_argument(
         '-i', '--input', 
@@ -194,6 +254,16 @@ if __name__ == "__main__":
         default=None,
         help="Optional file path/name destination to write a summary report file instead of printing to terminal."
     )
+    parser.add_argument(
+        '--sets',
+        default=None,
+        help="Target parameter subset range index limit block selection rule (e.g., '1-256' or '12')."
+    )
+    parser.add_argument(
+        '--runs',
+        default=None,
+        help="Target stochastic simulation run count boundary rule constraints (e.g., '1-500' or '1000')."
+    )
     
     args = parser.parse_args()
     
@@ -201,5 +271,11 @@ if __name__ == "__main__":
         print(f"[FATAL ERROR] Target folder directory path does not exist: {args.input}")
         sys.exit(1)
         
-    inspector = ParquetDatasetInspector(args.input, args.output)
+    inspector = ParquetDatasetInspector(
+        root_dir=args.input, 
+        output_file=args.output, 
+        sets_range=args.sets, 
+        runs_range=args.runs
+    )
     inspector.inspect()
+    

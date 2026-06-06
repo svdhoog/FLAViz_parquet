@@ -30,7 +30,7 @@ echo "Data conversion from: $INPUT_DIR, writing Parquet files to: $OUTPUT_FILE"
 #python sql_to_parquet.py --input $INPUT_DIR --output $OUTPUT_DIR --sets 1-2 --runs 1-2 #--force
 
 # Test medium:
-python sql_to_parquet.py --input $INPUT_DIR --output $OUTPUT_DIR --sets 1-1 --runs 1-1000 #--force
+#python sql_to_parquet.py --input $INPUT_DIR --output $OUTPUT_DIR --sets 1-1 --runs 1-1000 #--force
 
 # Full:
 #python sql_to_parquet.py --input $INPUT_DIR --output $OUTPUT_DIR --sets 1-513 --runs 1-1000 #--force
