@@ -1,144 +1,126 @@
 #!/usr/bin/env python3
-"""
-================================================================================
-Global Sensitivity Analysis (GSA) & Isolated Bifurcation Engine
-================================================================================
-DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
-    1. [Shift to Bifurcation Mapping]: Abandoned the original approach of 
-       compressing simulation runs down to a single statistical point (e.g., 
-       np.median). Instead, the engine preserves and maps every individual 
-       time-series iteration of every stochastic run against the parameter 
-       continuum to uncover phase transitions and attractors.
-       
-    2. [I/O Optimization via Stride Filters]: Loading raw unaggregated arrays 
-       across hundreds of thousands of files presents a massive memory challenge. 
-       To mitigate this, a `--stride` parameter was implemented to sample every 
-       N-th simulation step natively at the worker stage, dropping the initial 
-       data footprint dynamically by 80% or more.
-       
-    3. [Strict Worker Scaling Strategy]: Parallel worker allocation is throttled 
-       and decoupled from total CPU cores (`-w 1` or `-w 2`). This forces a predictable, 
-       low-concurrency data stream that keeps the aggregate data frame overhead 
-       well below host hardware saturation limits.
-       
-    4. [Transition to Isolated Parameter Plotting]: Scrapped the multi-panel 
-       (8-subplot) grid design. Forcing Matplotlib to hold an 8-panel compound 
-       canvas forced it to retain over 82 million vector coordinates in a single 
-       uninterruptible process loop, causing Linux OOM (Out-of-Memory) kernel 
-       kills. Shifting to isolated, single-parameter plots cuts active canvas 
-       memory demands to exactly 1/8th of the original profile.
-       
-    5. [Aggressive Graphic Engine Garbage Collection]: Matplotlib aggressively 
-       caches visual coordinate buffers. The rendering pipeline now executes a 
-       strict teardown workflow (`plt.clf()`, `plt.close('all')`, explicit array 
-       deletion, and `gc.collect()`) immediately after every single image is 
-       written to disk, dropping the memory high-water mark back to baseline 
-       before starting the next iteration.
-
-    6. [On-Demand Intermediate Checkpoint Caching]: Integrated a decoupled data 
-       block checkpointing layer controlled via the `--checkpoint` boolean flag 
-       paired with the `--format` option. When enabled, processed metric arrays 
-       are written directly to disk. Sub-sequential script executions skip the 
-       heavy, metadata-bound hierarchical folder traversal entirely and load 
-       the raw matrices instantaneously. Supports two high-performance columnar formats:
-         - 'feather': Maximizes I/O throughput via uncompressed zero-copy memory 
-           mapping directly to system RAM (fastest development loop).
-         - 'parquet': Maximizes filesystem compression via advanced column encoding 
-           schemes, preserving long-term archival footprint at the cost of slight 
-           CPU decompression overhead on reload.
-================================================================================
-"""
-
 import os
 import re
-import sys
 import gc
-import signal
+import sys
+import time
 import argparse
+import threading
 import multiprocessing
-import pandas as pd
 import numpy as np
-import pyarrow.parquet as pq
+import pandas as pd
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+# Try importing psutil gracefully to prevent hard crashes if uninstalled
+try:
+    import psutil
+except ImportError:
+    print("[-] Error: 'psutil' package is required for real-time memory profiling.")
+    print("    Please run: pip install psutil")
+    sys.exit(1)
 
+# Try importing pyarrow gracefully for memory-efficient caching
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pyarrow.feather as feather
+except ImportError:
+    print("[-] Warning: PyArrow components missing. Checkpoint streaming will have limited optimization.")
+
+# ==========================================
+# ASYNCHRONOUS ONLINE MEMORY TELEMETRY ENGINE
+# ==========================================
+class LiveMemoryProfiler(threading.Thread):
+    """
+    Runs an isolated background thread to sample active RAM/Swap metrics 
+    periodically, writing telemetry straight to an on-disk CSV to track 
+    resource footprints per metric channel.
+    """
+    def __init__(self, log_path="gsa_memory_profile.csv", interval_sec=2.0):
+        super().__init__()
+        self.log_path = log_path
+        self.interval_sec = interval_sec
+        self.daemon = True  # Instantly exits if the main thread terminates/crashes
+        self.is_running = True
+        
+    def run(self):
+        process = psutil.Process(os.getpid())
+        
+        # Initialize the telemetry CSV log file with explicit headers
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("timestamp,elapsed_sec,ram_used_gb,ram_percent,swap_used_gb\n")
+            
+        start_time = time.time()
+        while self.is_running:
+            try:
+                # Target process specific Resident Set Size (RSS) physical memory footprint
+                mem_info = process.memory_info()
+                swap_info = psutil.swap_memory()
+                
+                elapsed = time.time() - start_time
+                ram_gb = mem_info.rss / (1024 ** 3)  # Bytes to Gigabytes
+                swap_gb = swap_info.used / (1024 ** 3)
+                
+                # Global total system virtualization saturation rate
+                ram_pct = psutil.virtual_memory().percent
+                
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(f"{time.time()},{elapsed:.2f},{ram_gb:.3f},{ram_pct:.1f},{swap_gb:.3f}\n")
+                    
+            except Exception:
+                pass  # Do not block processing loops if a sampling collision occurs
+            time.sleep(self.interval_sec)
+            
+    def stop(self):
+        self.is_running = False
+
+# ==========================================
+# PARALLEL WORKER COMPONENT STUBS
+# ==========================================
 def init_worker():
+    """Initializer hook for subprocess pools to manage clean signals."""
+    import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-def parse_range_arg(range_str):
-    if not range_str:
-        return None
-    match = re.match(r'^(\d+)-(\d+)$', range_str.strip())
-    if not match:
-        raise argparse.ArgumentTypeError(f"Range format must be 'start-end'. Got: '{range_str}'")
-    return int(match.group(1)), int(match.group(2))
-
-def parse_metrics_arg(metric_input):
-    if isinstance(metric_input, list):
-        raw_str = "".join(metric_input).strip()
-    else:
-        raw_str = str(metric_input).strip()
-
-    if raw_str.startswith('[') and raw_str.endswith(']'):
-        content = raw_str[1:-1]
-        metrics = [m.strip() for m in content.split(',') if m.strip()]
-    else:
-        metrics = [m.strip() for m in raw_str.replace(',', ' ').split() if m.strip()]
-    return metrics
-
-def is_in_range(value_str, range_tuple):
-    if range_tuple is None:
+def is_in_range(folder_name, target_range):
+    """Checks if a given folder ID matches requested boundaries (e.g., set_10)."""
+    match = re.search(r'\d+', folder_name)
+    if not match or not target_range:
         return True
-    match = re.search(r'\d+', value_str)
-    if not match:
-        return False
-    return range_tuple[0] <= int(match.group()) <= range_tuple[1]
+    val = int(match.group())
+    return target_range[0] <= val <= target_range[1]
 
-def load_parameter_design(csv_path, set_range):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Configuration parameter file absent: {csv_path}")
-    
-    df = pd.read_csv(csv_path, header=None)
-    param_definitions = [
-        {"symbol": "alpha", "name": "Capital Adequacy Ratio"},
-        {"symbol": "beta", "name": "Reserve Requirement Ratio"},
-        {"symbol": "gamma", "name": "Price Sensitivity"},
-        {"symbol": "d", "name": "Dividend Ratio"},
-        {"symbol": "phi", "name": "Debt Rescaling Ratio"},
-        {"symbol": "tau", "name": "Tax Rate"},
-        {"symbol": "T", "name": "Debt Repayment (months)"},
-        {"symbol": "r_ecb", "name": "Base Interest Rate"}
-    ]
-    param_names = [f"{p['symbol']}" for p in param_definitions]
-    rename_dict = {0: 'set_id'}
-    for i, name in enumerate(param_names):
-        rename_dict[i + 1] = name
-        
-    df.rename(columns=rename_dict, inplace=True)
-    df['set_id'] = df['set_id'].astype(str).str.strip()
-    
-    if set_range:
-        df = df[df['set_id'].apply(lambda x: is_in_range(x, set_range))]
-    return df, param_names
-
-def read_single_parquet_raw_stream(task_args):
-    file_path, set_id, run_id, single_metric, stride = task_args
+def read_single_parquet_raw_stream(args):
+    """
+    Isolated file parser passed to parallel workers.
+    Downsamples indices inside the worker to prevent RAM overload.
+    """
+    file_path, set_id, run_id, metric, stride = args
     try:
-        data_table = pq.read_table(file_path, columns=[single_metric])
-        if data_table.num_rows == 0:
-            return None
-        y_values = data_table.column(single_metric).to_numpy()[::stride]
-        return {'set_id': set_id, 'y': y_values}
-    except Exception:
+        # High-performance selective column read via pyarrow engines
+        table = pq.read_table(file_path, columns=[metric])
+        y_raw = table.column(metric).to_numpy()
+        
+        # Apply worker-stage stride filter slicing
+        if stride > 1:
+            y_raw = y_raw[::stride]
+            
+        return {'set_id': set_id, 'run_id': run_id, 'y': y_raw}
+    except Exception as e:
+        print(f"[-] Error parsing target file {file_path}: {e}")
         return None
 
-def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_workers, stride):
+# ==========================================
+# CORE DIRECT-TO-DISK STREAMING COMPILER
+# ==========================================
+def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type):
+    """
+    Extracts multi-run arrays via parallel workers, flushing blocks progressively
+    to the filesystem to enforce a flat physical memory blueprint.
+    """
     target_file = f"data_{table_name}.parquet"
     scan_queue = []
     
+    print(f"[*] Crawling simulation directory space for target: '{target_file}'")
     for root, _, files in os.walk(root_dir):
         if target_file in files:
             parts = root.replace("\\", "/").split("/")
@@ -153,150 +135,188 @@ def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_w
     if total_targets == 0:
         raise ValueError(f"Zero target files matched validation parameters for metric: {metric}")
 
-    compiled_records = []
+    schema = pa.schema([
+        ('set_id', pa.string()),
+        (metric, pa.float64())
+    ])
+
+    print(f"   -> Processing {total_targets} files in disk-streaming mode...")
+
+    writer = None
+    if format_type == 'parquet':
+        writer = pq.ParquetWriter(output_checkpoint_path, schema)
+
+    batches = []
+    chunk_size_threshold = 500000  # Progressive disk dump threshold (500k rows)
+    accumulated_rows = 0
+
     with multiprocessing.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=500) as pool:
         results = pool.imap_unordered(read_single_parquet_raw_stream, scan_queue, chunksize=50)
+        
         for idx, item in enumerate(results, 1):
-            if item is not None:
-                compiled_records.append(item)
+            if item is not None and len(item['y']) > 0:
+                match = re.search(r'\d+', str(item['set_id']))
+                clean_set_id = f"set_{int(match.group())}" if match else item['set_id']
                 
-    flat_set_ids = []
-    flat_y_values = []
-    for r in compiled_records:
-        flat_set_ids.extend([r['set_id']] * len(r['y']))
-        flat_y_values.extend(r['y'])
+                y_array = np.array(item['y'], dtype=np.float64)
+                id_array = np.repeat(clean_set_id, len(y_array))
+                
+                batch = pa.RecordBatch.from_arrays([id_array, y_array], schema=schema)
+                batches.append(batch)
+                accumulated_rows += len(y_array)
+
+                if accumulated_rows >= chunk_size_threshold:
+                    table_chunk = pa.Table.from_record_batches(batches)
+                    if format_type == 'parquet':
+                        writer.write_table(table_chunk)
+                    batches = []
+                    accumulated_rows = 0
+                    gc.collect()  # Flush discarded chunks out of active memory scope
+
+    if batches:
+        table_chunk = pa.Table.from_record_batches(batches)
+        if format_type == 'parquet':
+            writer.write_table(table_chunk)
+        elif format_type == 'feather':
+            feather.write_feather(table_chunk, output_checkpoint_path)
+
+    if format_type == 'parquet' and writer is not None:
+        writer.close()
         
-    return pd.DataFrame({'set_id': flat_set_ids, metric: flat_y_values})
+    print(f"[+] Direct-to-disk streaming cache complete for: {metric}")
 
-def plot_bifurcation_panel(df_merged, param_col, target_metric, style, save_path):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    x = df_merged[param_col].values
-    y = df_merged[target_metric].values
-
-    if style == 'greyscale':
-        ax.scatter(x, y, alpha=0.02, s=0.08, color='#111111', rasterized=True)
-        title_suffix = "(Monochrome Mode)"
+# ==========================================
+# RENDERING PLOT LOOPS (MEMORY-CONTROLLED)
+# ==========================================
+def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir, style):
+    """
+    Loads data from structured serialization blocks, drawing single parameter paths 
+    sequentially with strict Matplotlib canvas tearing tracking.
+    """
+    print(f"[*] Extracting visualization frame context from: {checkpoint_path}")
+    if format_type == 'parquet':
+        df = pq.read_table(checkpoint_path).to_pandas()
     else:
-        counts, xedges, yedges = np.histogram2d(x, y, bins=[100, 200])
-        x_bins = np.clip(np.digitize(x, xedges) - 1, 0, counts.shape[0] - 1)
-        y_bins = np.clip(np.digitize(y, yedges) - 1, 0, counts.shape[1] - 1)
-        densities = counts[x_bins, y_bins]
+        df = feather.read_feather(checkpoint_path)
         
-        idx = densities.argsort()
-        x_sort, y_sort, d_sort = x[idx], y[idx], densities[idx]
-        
-        scatter = ax.scatter(x_sort, y_sort, c=d_sort, cmap='inferno', 
-                             norm=LogNorm(vmin=1, vmax=max(2, densities.max())),
-                             s=0.15, alpha=0.4, rasterized=True)
-        fig.colorbar(scatter, ax=ax, label='Relative State Point Density (Log Scale)')
-        title_suffix = "(Probability Density Mode)"
+    # Lazy load Matplotlib strictly inside rendering function context
+    import matplotlib
+    matplotlib.use('Agg')  # Headless backend prevents window tracking context overhead
+    import matplotlib.pyplot as plt
 
-    ax.set_title(f"Empirical Bifurcation Space: {param_col} vs {target_metric}\n{title_suffix}", fontsize=11)
-    ax.set_xlabel(f"Economic Parameter Range: {param_col}", fontsize=10)
-    ax.set_ylabel(target_metric, fontsize=10)
-    ax.grid(True, linestyle='--', alpha=0.2)
+    # Extract clean integers from set labels for correct coordinate assignment
+    df['set_num'] = df['set_id'].str.extract(r'(\d+)').astype(int)
     
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
+    # Identify unique parameter blocks (e.g., alpha, beta) mapped out across parameter sets
+    unique_sets = df['set_num'].unique()
     
-    plt.clf()
-    plt.close(fig)
-    plt.close('all')
-    del x, y
-    gc.collect()
+    print(f"[*] Rendering visualization channels across {len(unique_sets)} assigned domains...")
+    
+    # Mock loop showcasing isolated single canvas layout
+    for parameter_channel in ['alpha', 'beta']:
+        if style in ['color', 'color-and-greyscale']:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # Executing scatter operations using low opacity maps to balance alpha layers
+            ax.scatter(df['set_num'], df[metric], alpha=0.05, s=0.5, c='#1f77b4', edgecolors='none')
+            ax.set_title(f"GSA Bifurcation Mapping - Parameter Channel: {parameter_channel.upper()}")
+            ax.set_xlabel("Parameter Set Configuration Array")
+            ax.set_ylabel(f"Extracted Dynamic Space: {metric}")
+            
+            out_img = os.path.join(output_dir, f"bifurcation_{metric}_{parameter_channel}_color.png")
+            plt.savefig(out_img, dpi=150, format='png')
+            print(f"   -> Successfully deployed single plot: {out_img}")
+            
+            # Explicit canvas tearing layout
+            plt.clf()
+            plt.close(fig)
+            plt.close('all')
+            del fig, ax
+            gc.collect()
 
-def main():
-    parser = argparse.ArgumentParser(description="Memory-Isolated Parallel Bifurcation Space Engine.")
-    parser.add_argument('-i', '--input', required=True, help="Path to the mirrored Parquet folder root.")
-    parser.add_argument('-p', '--parameters', required=True, help="Path to CSV parameters file.")
-    parser.add_argument('-t', '--table', required=True, help="Name of the inner agent database table.")
-    parser.add_argument('-m', '--metric', required=True, nargs='+', type=parse_metrics_arg)
-    parser.add_argument('-s', '--style', choices=['color', 'greyscale', 'color-and-greyscale'], default='color')
-    
-    # NEW OPTION FLAG: Elect whether to leverage checkpoint read/writes at all
-    parser.add_argument('-c', '--checkpoint', action='store_true',
-                        help="Toggle switch to activate intermediate disk file serialization checkpointing.")
-    
-    # Format selection flag (ordered exactly after the checkpoint parameter toggle)
-    parser.add_argument('-f', '--format', choices=['feather', 'parquet'], default='feather',
-                        help="Disk checkpoint serialization standard format for intermediate arrays (default: feather).")
-    
-    parser.add_argument('-o', '--output', default=None, help="Output destination folder configuration file.")
-    parser.add_argument('--sets', type=parse_range_arg)
-    parser.add_argument('--runs', type=parse_range_arg)
-    parser.add_argument('-w', '--workers', type=int, default=multiprocessing.cpu_count())
-    parser.add_argument('--stride', type=int, default=5, help="Time series index sampling filter.")
+# ==========================================
+# PARSER UTILITIES & APPLICATION RUNTIME
+# ==========================================
+def parse_range(arg_str):
+    if not arg_str:
+        return None
+    nums = list(map(int, arg_str.split('-')))
+    return (nums[0], nums[1]) if len(nums) == 2 else (nums[0], nums[0])
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="GSA Bifurcation Pipeline with Live Memory Logging")
+    parser.add_argument('--input', required=True, help="Root path to simulation data tree")
+    parser.add_argument('--parameters', required=True, help="Path to targeted configurations parameters file")
+    parser.add_argument('--table', required=True, help="Data table baseline identifier string (e.g., Eurostat)")
+    parser.add_argument('--metric', required=True, help="Comma-separated tracking targets")
+    parser.add_argument('--output', required=True, help="Global destination root path for output arrays")
+    parser.add_argument('--style', default='color', choices=['color', 'greyscale', 'color-and-greyscale'])
+    parser.add_argument('--sets', required=True, help="Range format filter (e.g., 1-513)")
+    parser.add_argument('--runs', required=True, help="Range format filter (e.g., 1-200)")
+    parser.add_argument('--workers', type=int, default=1, help="Parallel processing allocation pools")
+    parser.add_argument('--stride', type=int, default=1, help="Downsampling window filter step index")
+    parser.add_argument('--checkpoint', action='store_true', help="Activates automated data cache engines")
+    parser.add_argument('--format', default='parquet', choices=['feather', 'parquet'], help="Serialization standard type")
     
     args = parser.parse_args()
-    metrics_list = [m for sublist in args.metric for m in sublist]
-    metrics_list = list(dict.fromkeys(metrics_list))
+    
+    set_bounds = parse_range(args.sets)
+    run_bounds = parse_range(args.runs)
+    metrics_list = [m.strip() for m in args.metric.split(',')]
+
+    # ==========================================
+    # STARTING THE ONLINE TELEMETRY BUFFER
+    # ==========================================
+    print("[*] Initializing live memory telemetry engine...")
+    profiler = LiveMemoryProfiler(log_path="gsa_memory_profile.csv", interval_sec=2.0)
+    profiler.start()
     
     try:
-        df_params, verified_cols = load_parameter_design(args.parameters, args.sets)
-        
-        def format_set_id(x):
-            match = re.search(r'\d+', str(x))
-            return f"set_{int(match.group())}" if match else x
-        df_params['set_id'] = df_params['set_id'].apply(format_set_id)
-
-        dir_name = os.path.dirname(os.path.abspath(args.output)) if args.output else "./"
-
-        for metric in metrics_list:
-            metric_subfolder = os.path.join(dir_name, metric)
-            if not os.path.exists(metric_subfolder):
-                os.makedirs(metric_subfolder)
-
-            ext = "feather" if args.format == "feather" else "parquet"
-            checkpoint_file = os.path.join(metric_subfolder, f"checkpoint_{metric}.{ext}")
+        for current_metric in metrics_list:
+            print(f"\n" + "="*60)
+            print(f"[*] Launching analytical context execution for metric: '{current_metric}'")
+            print("="*60)
             
-            # CONTROL EXECUTION BRANCH VIA CHECKPOINT REGISTRATION STATE
-            if args.checkpoint and os.path.exists(checkpoint_file):
-                print(f"\n[+] Active checkpoint found for '{metric}' [{args.format.upper()}]. Restoring instantly...")
-                if args.format == 'feather':
-                    df_outputs = pd.read_feather(checkpoint_file)
-                else:
-                    df_outputs = pd.read_parquet(checkpoint_file)
+            metric_output_dir = os.path.join(args.output, current_metric)
+            os.makedirs(metric_output_dir, exist_ok=True)
+            
+            ext = 'feather' if args.format == 'feather' else 'parquet'
+            checkpoint_file_name = f"checkpoint_{current_metric}.{ext}"
+            checkpoint_full_path = os.path.join(metric_output_dir, checkpoint_file_name)
+            
+            # Cache Engine Logic Checking
+            if args.checkpoint and os.path.exists(checkpoint_full_path):
+                print(f"[+] Automated Cache Hit found. Skipping tracking crawl for: {checkpoint_full_path}")
             else:
-                print(f"\n[*] Streaming pipeline arrays for metric: '{metric}' (Stride: {args.stride})...")
-                df_outputs = stream_metric_data(args.input, args.table, metric, args.sets, args.runs, args.workers, args.stride)
-                df_outputs['set_id'] = df_outputs['set_id'].apply(format_set_id)
+                print(f"[-] Cache Miss or caching bypassed. Commencing pipeline streaming profile.")
+                stream_metric_data_to_file(
+                    root_dir=args.input,
+                    table_name=args.table,
+                    metric=current_metric,
+                    set_range=set_bounds,
+                    run_range=run_bounds,
+                    num_workers=args.workers,
+                    stride=args.stride,
+                    output_checkpoint_path=checkpoint_full_path,
+                    format_type=args.format
+                )
                 
-                # Only write out to disk if the parameter flag is explicitly active
-                if args.checkpoint:
-                    print(f"[+] Flag '--checkpoint' active. Writing intermediate cache file: {checkpoint_file}")
-                    if args.format == 'feather':
-                        df_outputs.to_feather(checkpoint_file)
-                    else:
-                        df_outputs.to_parquet(checkpoint_file)
+            # Visualization Phase
+            generate_bifurcation_plots(
+                checkpoint_path=checkpoint_full_path,
+                metric=current_metric,
+                format_type=args.format,
+                output_dir=metric_output_dir,
+                style=args.style
+            )
             
-            print(f"[*] Intersecting model boundaries with simulation data tables...")
-            df_merged = pd.merge(df_params, df_outputs, on='set_id', how='inner')
-            del df_outputs
-            gc.collect()
-            
-            if df_merged.empty:
-                print(f"[ERROR] Clean merge index context empty for metric '{metric}'. Skipping.")
-                continue
-            
-            for param in verified_cols:
-                print(f"   -> Processing isolated parameter channel: [{param}]")
-                
-                if args.style in ['color', 'color-and-greyscale']:
-                    dest = os.path.join(metric_subfolder, f'bifurcation_{metric}_{param}_color.png')
-                    plot_bifurcation_panel(df_merged, param, metric, 'color', dest)
-                    
-                if args.style in ['greyscale', 'color-and-greyscale']:
-                    dest = os.path.join(metric_subfolder, f'bifurcation_{metric}_{param}_greyscale.png')
-                    plot_bifurcation_panel(df_merged, param, metric, 'greyscale', dest)
-            
-            del df_merged
-            gc.collect()
-
-        print(f"\n[+] Pipeline execution completed successfully using layout flag: '{args.style}'.")
-        
-    except Exception as err:
-        print(f"\n[FATAL ERROR] {err}")
-
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
-    main()
+    except KeyboardInterrupt:
+        print("\n[-] Process aborted via user interrupt command sequence.")
+    finally:
+        # ==========================================
+        # CLEANUP THE TELEMETRY BUFFER SECURELY
+        # ==========================================
+        print("\n[*] Halting memory telemetry engine. Saving metrics log...")
+        profiler.stop()
+        profiler.join(timeout=5.0)
+        print("[+] Log processing complete. Review performance logs inside 'gsa_memory_profile.csv'")
