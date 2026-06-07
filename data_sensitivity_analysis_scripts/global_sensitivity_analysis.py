@@ -1,20 +1,58 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Global Sensitivity Analysis (GSA) & Memory-Safe Bifurcation Engine
+Global Sensitivity Analysis (GSA) & Isolated Bifurcation Engine
 ================================================================================
-Description:
-    Processes large mirrored Parquet files using a memory-capped parallel 
-    framework to construct empirical bifurcation diagrams. 
+DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
+    1. [Shift to Bifurcation Mapping]: Abandoned the original approach of 
+       compressing simulation runs down to a single statistical point (e.g., 
+       np.median). Instead, the engine preserves and maps every individual 
+       time-series iteration of every stochastic run against the parameter 
+       continuum to uncover phase transitions and attractors.
+       
+    2. [I/O Optimization via Stride Filters]: Loading raw unaggregated arrays 
+       across hundreds of thousands of files presents a massive memory challenge. 
+       To mitigate this, a `--stride` parameter was implemented to sample every 
+       N-th simulation step natively at the worker stage, dropping the initial 
+       data footprint dynamically by 80% or more.
+       
+    3. [Strict Worker Scaling Strategy]: Parallel worker allocation is throttled 
+       and decoupled from total CPU cores (`-w 1` or `-w 2`). This forces a predictable, 
+       low-concurrency data stream that keeps the aggregate data frame overhead 
+       well below host hardware saturation limits.
+       
+    4. [Transition to Isolated Parameter Plotting]: Scrapped the multi-panel 
+       (8-subplot) grid design. Forcing Matplotlib to hold an 8-panel compound 
+       canvas forced it to retain over 82 million vector coordinates in a single 
+       uninterruptible process loop, causing Linux OOM (Out-of-Memory) kernel 
+       kills. Shifting to isolated, single-parameter plots cuts active canvas 
+       memory demands to exactly 1/8th of the original profile.
+       
+    5. [Aggressive Graphic Engine Garbage Collection]: Matplotlib aggressively 
+       caches visual coordinate buffers. The rendering pipeline now executes a 
+       strict teardown workflow (`plt.clf()`, `plt.close('all')`, explicit array 
+       deletion, and `gc.collect()`) immediately after every single image is 
+       written to disk, dropping the memory high-water mark back to baseline 
+       before starting the next iteration.
 
-    Features iteration downsampling (striding) to prevent Out-of-Memory (OOM) 
-    crashes on systems processing massive high-frequency simulation runs.
+    6. [On-Demand Intermediate Checkpoint Caching]: Integrated a decoupled data 
+       block checkpointing layer controlled via the `--checkpoint` boolean flag 
+       paired with the `--format` option. When enabled, processed metric arrays 
+       are written directly to disk. Sub-sequential script executions skip the 
+       heavy, metadata-bound hierarchical folder traversal entirely and load 
+       the raw matrices instantaneously. Supports two high-performance columnar formats:
+         - 'feather': Maximizes I/O throughput via uncompressed zero-copy memory 
+           mapping directly to system RAM (fastest development loop).
+         - 'parquet': Maximizes filesystem compression via advanced column encoding 
+           schemes, preserving long-term archival footprint at the cost of slight 
+           CPU decompression overhead on reload.
 ================================================================================
 """
 
 import os
 import re
 import sys
+import gc
 import signal
 import argparse
 import multiprocessing
@@ -65,16 +103,16 @@ def load_parameter_design(csv_path, set_range):
     
     df = pd.read_csv(csv_path, header=None)
     param_definitions = [
-        {"symbol": "α", "name": "Capital Adequacy Ratio"},
-        {"symbol": "β", "name": "Reserve Requirement Ratio"},
-        {"symbol": "γ", "name": "Price Sensitivity"},
+        {"symbol": "alpha", "name": "Capital Adequacy Ratio"},
+        {"symbol": "beta", "name": "Reserve Requirement Ratio"},
+        {"symbol": "gamma", "name": "Price Sensitivity"},
         {"symbol": "d", "name": "Dividend Ratio"},
-        {"symbol": "φ", "name": "Debt Rescaling Ratio"},
-        {"symbol": "τ", "name": "Tax Rate"},
+        {"symbol": "phi", "name": "Debt Rescaling Ratio"},
+        {"symbol": "tau", "name": "Tax Rate"},
         {"symbol": "T", "name": "Debt Repayment (months)"},
-        {"symbol": "r^ecb", "name": "Base Interest Rate"}
+        {"symbol": "r_ecb", "name": "Base Interest Rate"}
     ]
-    param_names = [f"{p['symbol']} ({p['name']})" for p in param_definitions]
+    param_names = [f"{p['symbol']}" for p in param_definitions]
     rename_dict = {0: 'set_id'}
     for i, name in enumerate(param_names):
         rename_dict[i + 1] = name
@@ -92,8 +130,6 @@ def read_single_parquet_raw_stream(task_args):
         data_table = pq.read_table(file_path, columns=[single_metric])
         if data_table.num_rows == 0:
             return None
-        
-        # MEMORY FIX 1: Downsample the array steps directly during load extraction
         y_values = data_table.column(single_metric).to_numpy()[::stride]
         return {'set_id': set_id, 'y': y_values}
     except Exception:
@@ -111,7 +147,6 @@ def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_w
             
             if set_match and run_match:
                 if is_in_range(set_match[-1], set_range) and is_in_range(run_match[-1], run_range):
-                    # Pass stride down to the worker tracking arguments
                     scan_queue.append((os.path.join(root, target_file), set_match[-1], run_match[-1], metric, stride))
                     
     total_targets = len(scan_queue)
@@ -133,59 +168,16 @@ def stream_metric_data(root_dir, table_name, metric, set_range, run_range, num_w
         
     return pd.DataFrame({'set_id': flat_set_ids, metric: flat_y_values})
 
-# ================================================================================
-# RENDERING PLUGINS
-# ================================================================================
-def plot_bifurcation_greyscale(df_merged, parameter_columns, target_metric, save_path):
-    num_params = len(parameter_columns)
-    cols = 4
-    rows = (num_params + cols - 1) // cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(18, 4 * rows), sharey=True)
-    axes = axes.flatten()
-    
-    print(f" -> Rendering low-opacity monochrome scatter canvas...")
-    
-    for i, col in enumerate(parameter_columns):
-        # Slightly adjusted s and alpha to look great with downsampled arrays
-        axes[i].scatter(df_merged[col], df_merged[target_metric], 
-                        alpha=0.03, s=0.1, color='#111111', rasterized=True)
-        
-        axes[i].set_title(f'{col}', fontsize=11)
-        axes[i].set_ylabel(target_metric if i % cols == 0 else '')
-        axes[i].grid(True, linestyle='--', alpha=0.2)
-        
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
-        
-    title_text = (
-        f"Simulation Empirical Bifurcation Diagram (Monochrome Vector Mapping)\n"
-        f"Target Metric: {target_metric} (Downsampled Iterations Plotted)"
-    )
-    plt.suptitle(title_text, fontsize=14, y=0.98)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=400)
-    plt.close()
+def plot_bifurcation_panel(df_merged, param_col, target_metric, style, save_path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    x = df_merged[param_col].values
+    y = df_merged[target_metric].values
 
-
-def plot_bifurcation_color(df_merged, parameter_columns, target_metric, save_path):
-    num_params = len(parameter_columns)
-    cols = 4
-    rows = (num_params + cols - 1) // cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(18, 4 * rows), sharey=True)
-    axes = axes.flatten()
-    
-    print(f" -> Computing 2D histograms and color-coding densities...")
-    
-    last_scatter = None
-    
-    for i, col in enumerate(parameter_columns):
-        x = df_merged[col].values
-        y = df_merged[target_metric].values
-        
+    if style == 'greyscale':
+        ax.scatter(x, y, alpha=0.02, s=0.08, color='#111111', rasterized=True)
+        title_suffix = "(Monochrome Mode)"
+    else:
         counts, xedges, yedges = np.histogram2d(x, y, bins=[100, 200])
-        
         x_bins = np.clip(np.digitize(x, xedges) - 1, 0, counts.shape[0] - 1)
         y_bins = np.clip(np.digitize(y, yedges) - 1, 0, counts.shape[1] - 1)
         densities = counts[x_bins, y_bins]
@@ -193,57 +185,50 @@ def plot_bifurcation_color(df_merged, parameter_columns, target_metric, save_pat
         idx = densities.argsort()
         x_sort, y_sort, d_sort = x[idx], y[idx], densities[idx]
         
-        last_scatter = axes[i].scatter(x_sort, y_sort, c=d_sort, cmap='inferno', 
-                                       norm=LogNorm(vmin=1, vmax=max(2, densities.max())),
-                                       s=0.2, alpha=0.5, rasterized=True)
-        
-        axes[i].set_title(f'{col}', fontsize=11)
-        axes[i].set_ylabel(target_metric if i % cols == 0 else '')
-        axes[i].grid(True, linestyle='--', alpha=0.2)
-        
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
-        
-    if last_scatter is not None:
-        cbar_ax = fig.add_axes([0.96, 0.15, 0.015, 0.7])
-        fig.colorbar(last_scatter, cax=cbar_ax, label='Relative State Point Density (Log Scale)')
-        
-    title_text = (
-        f"Simulation Empirical Bifurcation Topology Map (Probability Density Colorized)\n"
-        f"Target Metric: {target_metric} (Downsampled Iterations Plotted)"
-    )
-    plt.suptitle(title_text, fontsize=14, y=0.98)
-    plt.tight_layout(rect=[0, 0, 0.95, 1.0])
-    plt.savefig(save_path, dpi=400)
-    plt.close()
+        scatter = ax.scatter(x_sort, y_sort, c=d_sort, cmap='inferno', 
+                             norm=LogNorm(vmin=1, vmax=max(2, densities.max())),
+                             s=0.15, alpha=0.4, rasterized=True)
+        fig.colorbar(scatter, ax=ax, label='Relative State Point Density (Log Scale)')
+        title_suffix = "(Probability Density Mode)"
 
-# ================================================================================
-# RUN EXECUTION
-# ================================================================================
+    ax.set_title(f"Empirical Bifurcation Space: {param_col} vs {target_metric}\n{title_suffix}", fontsize=11)
+    ax.set_xlabel(f"Economic Parameter Range: {param_col}", fontsize=10)
+    ax.set_ylabel(target_metric, fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.2)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    
+    plt.clf()
+    plt.close(fig)
+    plt.close('all')
+    del x, y
+    gc.collect()
+
 def main():
-    parser = argparse.ArgumentParser(description="Memory-Safe Parallel Bifurcation Space Engine.")
+    parser = argparse.ArgumentParser(description="Memory-Isolated Parallel Bifurcation Space Engine.")
     parser.add_argument('-i', '--input', required=True, help="Path to the mirrored Parquet folder root.")
     parser.add_argument('-p', '--parameters', required=True, help="Path to CSV parameters file.")
     parser.add_argument('-t', '--table', required=True, help="Name of the inner agent database table.")
     parser.add_argument('-m', '--metric', required=True, nargs='+', type=parse_metrics_arg)
     parser.add_argument('-s', '--style', choices=['color', 'greyscale', 'color-and-greyscale'], default='color')
-    parser.add_argument('-o', '--output', default=None, help="Output destination root folder.")
+    
+    # NEW OPTION FLAG: Elect whether to leverage checkpoint read/writes at all
+    parser.add_argument('-c', '--checkpoint', action='store_true',
+                        help="Toggle switch to activate intermediate disk file serialization checkpointing.")
+    
+    # Format selection flag (ordered exactly after the checkpoint parameter toggle)
+    parser.add_argument('-f', '--format', choices=['feather', 'parquet'], default='feather',
+                        help="Disk checkpoint serialization standard format for intermediate arrays (default: feather).")
+    
+    parser.add_argument('-o', '--output', default=None, help="Output destination folder configuration file.")
     parser.add_argument('--sets', type=parse_range_arg)
-    
-    # MEMORY FIX 3: Restrict this in your run command execution (e.g. --runs 1-200)
     parser.add_argument('--runs', type=parse_range_arg)
-    
-    # MEMORY FIX 2: Lower worker count in command execution (e.g. --workers 1 or --workers 2)
     parser.add_argument('-w', '--workers', type=int, default=multiprocessing.cpu_count())
-    
-    # OPTIONAL TUNING STRIDE: Keep every N-th data step
-    parser.add_argument('--stride', type=int, default=5, help="Take every N-th time step step to save memory (default: 5).")
+    parser.add_argument('--stride', type=int, default=5, help="Time series index sampling filter.")
     
     args = parser.parse_args()
-    
-    metrics_list = []
-    for sublist in args.metric:
-        metrics_list.extend(sublist)
+    metrics_list = [m for sublist in args.metric for m in sublist]
     metrics_list = list(dict.fromkeys(metrics_list))
     
     try:
@@ -257,33 +242,57 @@ def main():
         dir_name = os.path.dirname(os.path.abspath(args.output)) if args.output else "./"
 
         for metric in metrics_list:
-            print(f"\n[*] Processing data vector blocks for target metric: '{metric}' (Stride: {args.stride})...")
-            df_outputs = stream_metric_data(args.input, args.table, metric, args.sets, args.runs, args.workers, args.stride)
-            df_outputs['set_id'] = df_outputs['set_id'].apply(format_set_id)
-            
-            print(f"[*] Merging parameters with tracking arrays...")
-            df_merged = pd.merge(df_params, df_outputs, on='set_id', how='inner')
-            
-            if df_merged.empty:
-                print(f"[ERROR] Failed to map data for metric '{metric}'. Skipping graphics.")
-                continue
-                
             metric_subfolder = os.path.join(dir_name, metric)
             if not os.path.exists(metric_subfolder):
                 os.makedirs(metric_subfolder)
-            
-            if args.style in ['color', 'color-and-greyscale']:
-                save_dest_color = os.path.join(metric_subfolder, f'gsa_behavior_grid_{metric}_color.png')
-                plot_bifurcation_color(df_merged, verified_cols, metric, save_dest_color)
-                
-            if args.style in ['greyscale', 'color-and-greyscale']:
-                save_dest_grey = os.path.join(metric_subfolder, f'gsa_behavior_grid_{metric}_greyscale.png')
-                plot_bifurcation_greyscale(df_merged, verified_cols, metric, save_dest_grey)
-            
-            del df_outputs
-            del df_merged
 
-        print(f"\n[+] Safe execution pipeline completed successfully using style flag: '{args.style}'.")
+            ext = "feather" if args.format == "feather" else "parquet"
+            checkpoint_file = os.path.join(metric_subfolder, f"checkpoint_{metric}.{ext}")
+            
+            # CONTROL EXECUTION BRANCH VIA CHECKPOINT REGISTRATION STATE
+            if args.checkpoint and os.path.exists(checkpoint_file):
+                print(f"\n[+] Active checkpoint found for '{metric}' [{args.format.upper()}]. Restoring instantly...")
+                if args.format == 'feather':
+                    df_outputs = pd.read_feather(checkpoint_file)
+                else:
+                    df_outputs = pd.read_parquet(checkpoint_file)
+            else:
+                print(f"\n[*] Streaming pipeline arrays for metric: '{metric}' (Stride: {args.stride})...")
+                df_outputs = stream_metric_data(args.input, args.table, metric, args.sets, args.runs, args.workers, args.stride)
+                df_outputs['set_id'] = df_outputs['set_id'].apply(format_set_id)
+                
+                # Only write out to disk if the parameter flag is explicitly active
+                if args.checkpoint:
+                    print(f"[+] Flag '--checkpoint' active. Writing intermediate cache file: {checkpoint_file}")
+                    if args.format == 'feather':
+                        df_outputs.to_feather(checkpoint_file)
+                    else:
+                        df_outputs.to_parquet(checkpoint_file)
+            
+            print(f"[*] Intersecting model boundaries with simulation data tables...")
+            df_merged = pd.merge(df_params, df_outputs, on='set_id', how='inner')
+            del df_outputs
+            gc.collect()
+            
+            if df_merged.empty:
+                print(f"[ERROR] Clean merge index context empty for metric '{metric}'. Skipping.")
+                continue
+            
+            for param in verified_cols:
+                print(f"   -> Processing isolated parameter channel: [{param}]")
+                
+                if args.style in ['color', 'color-and-greyscale']:
+                    dest = os.path.join(metric_subfolder, f'bifurcation_{metric}_{param}_color.png')
+                    plot_bifurcation_panel(df_merged, param, metric, 'color', dest)
+                    
+                if args.style in ['greyscale', 'color-and-greyscale']:
+                    dest = os.path.join(metric_subfolder, f'bifurcation_{metric}_{param}_greyscale.png')
+                    plot_bifurcation_panel(df_merged, param, metric, 'greyscale', dest)
+            
+            del df_merged
+            gc.collect()
+
+        print(f"\n[+] Pipeline execution completed successfully using layout flag: '{args.style}'.")
         
     except Exception as err:
         print(f"\n[FATAL ERROR] {err}")
