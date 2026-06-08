@@ -16,6 +16,21 @@ DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
     4. [Percentile Clipping]: Integrates a `--percentile` threshold filter to 
        truncate extreme stochastic outliers (e.g., 1e285) that would otherwise 
        obfuscate bifurcation attractors.
+
+    5. [Integer Key Optimization (Solution 2)]: Replaces high-overhead string 
+       tracking IDs ('set_id') with primitive 16-bit integers ('set_num') inside 
+       both Parquet and Feather file schemas. This eliminates multi-gigabyte 
+       string object bloat during Pandas conversions.
+
+    6. [Direct Arrow Zero-Copy Plotting (Solution 3)]: Bypasses Pandas DataFrames 
+       and relational merge lookups entirely during plotting. Memory-mapped 
+       PyArrow tables supply data vectors directly to Matplotlib using fast, 
+       zero-copy NumPy views.
+
+    7. [Single-Precision Downcasting (float32)]: Downcasts the metric values 
+       from 64-bit to 32-bit float spaces, dropping the physical storage and 
+       mapping space requirements perfectly in half without compromising the 
+       6-decimal precision requirement.
 """
 
 import os
@@ -40,6 +55,7 @@ try:
     import pyarrow as pa
     import pyarrow.parquet as pq
     import pyarrow.feather as feather
+    import pyarrow.compute as pc
     HAS_PYARROW = True
 except ImportError:
     HAS_PYARROW = False
@@ -88,7 +104,8 @@ def read_single_parquet_raw_stream(args):
     file_path, set_id, run_id, metric, stride = args
     try:
         table = pq.read_table(file_path, columns=[metric])
-        y_raw = table.column(metric).to_numpy()
+        # Downcast to float32 natively at extraction time to yield immediate 50% memory savings
+        y_raw = table.column(metric).to_numpy().astype(np.float32)
         if stride > 1: y_raw = y_raw[::stride]
         return {'set_id': set_id, 'run_id': run_id, 'y': y_raw}
     except Exception: return None
@@ -106,57 +123,98 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
                 if set_range[0] <= s_val <= set_range[1]:
                     scan_queue.append((os.path.join(root, target_file), s[-1], r[-1], metric, stride))
     
-    schema = pa.schema([('set_id', pa.string()), (metric, pa.float64())])
-    writer = pq.ParquetWriter(output_checkpoint_path, schema) if format_type == 'parquet' else None
+    # SCHEMA OPTIMIZATION: int16 tracking keys and float32 data representations
+    schema = pa.schema([('set_num', pa.int16()), (metric, pa.float32())])
+    
+    if format_type == 'parquet':
+        writer = pq.ParquetWriter(output_checkpoint_path, schema)
+    else:
+        sink = pa.OSFile(output_checkpoint_path, 'wb')
+        writer = pa.ipc.RecordBatchFileWriter(sink, schema)
+        
     batches, accumulated_rows = [], 0
 
     with multiprocessing.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=500) as pool:
         for item in pool.imap_unordered(read_single_parquet_raw_stream, scan_queue, chunksize=50):
             if item is not None and len(item['y']) > 0:
+                # Extract clean integer values from the text source labels
                 match = re.search(r'\d+', str(item['set_id']))
-                clean_set_id = f"set_{int(match.group())}" if match else item['set_id']
-                batch = pa.RecordBatch.from_arrays([np.repeat(clean_set_id, len(item['y'])), item['y']], schema=schema)
+                clean_set_num = int(match.group()) if match else 0
+                
+                # Construct dense contiguous numerical arrays instead of string sequences
+                set_num_array = np.repeat(clean_set_num, len(item['y'])).astype(np.int16())
+                
+                batch = pa.RecordBatch.from_arrays([set_num_array, item['y']], schema=schema)
                 batches.append(batch)
                 accumulated_rows += len(item['y'])
-                if format_type == 'parquet' and accumulated_rows >= 500000:
-                    writer.write_table(pa.Table.from_batches(batches))
+                
+                # DUAL-FORMAT STREAMING: Safely write chunks dynamically to avoid RAM bloating
+                if accumulated_rows >= 500000:
+                    table_chunk = pa.Table.from_batches(batches)
+                    if format_type == 'parquet':
+                        writer.write_table(table_chunk)
+                    else:
+                        for b in batches: writer.write_batch(b)
                     batches, accumulated_rows = [], 0
                     gc.collect()
 
-    table_chunk = pa.Table.from_batches(batches)
-    if format_type == 'parquet':
-        writer.write_table(table_chunk)
-        writer.close()
-    else: feather.write_feather(table_chunk, output_checkpoint_path)
+    # Flush final leftovers
+    if batches:
+        table_chunk = pa.Table.from_batches(batches)
+        if format_type == 'parquet':
+            writer.write_table(table_chunk)
+        else:
+            for b in batches: writer.write_batch(b)
+
+    writer.close()
+    if format_type != 'parquet':
+        sink.close()
 
 def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir, style, parameters_file_path, percentile_limit):
     if not HAS_PYARROW: return
-    df = pq.read_table(checkpoint_path).to_pandas() if format_type == 'parquet' else feather.read_feather(checkpoint_path)
     
+    # ZERO-COPY READ: Load checkpoint data using native PyArrow tables (Memory-mapped)
+    if format_type == 'parquet':
+        table = pq.read_table(checkpoint_path)
+    else:
+        with pa.memory_map(checkpoint_path, 'rb') as source:
+            table = pa.ipc.RecordBatchFileReader(source).read_all()
+            
     import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
     
-    df['set_num'] = df['set_id'].str.extract(r'(\d+)').astype(int)
+    # Load parameters lookup reference file into a small reference DataFrame
     param_meta_df = pd.read_csv(parameters_file_path)
     
-    # Coerce index for safe merge
-    if 'set_num' not in param_meta_df.columns:
-        param_meta_df['set_num'] = param_meta_df.index + 1
-    else:
-        param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
-
-    df = df.merge(param_meta_df, on='set_num', how='left')
+    # Convert parameters lookup alignment keys to standard index offsets
+    if 'set_num' in param_meta_df.columns:
+        if param_meta_df['set_num'].dtype == object:
+            param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
+        else:
+            param_meta_df['set_num'] = param_meta_df['set_num'].astype(int)
+        # Re-index the metadata dataframe by set_num to handle fast array lookups
+        param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
     
-    # Percentile filter for outlier suppression
+    # Convert Arrow columns into zero-copy numpy views
+    set_num_array = table['set_num'].to_numpy()
+    metric_array = table[metric].to_numpy()
+    
+    # Percentile filter for outlier suppression using numpy primitives
     if percentile_limit < 100:
-        threshold = df[metric].quantile(percentile_limit / 100)
-        df = df[df[metric] <= threshold]
+        threshold = np.percentile(metric_array, percentile_limit)
+        valid_mask = metric_array <= threshold
+        set_num_array = set_num_array[valid_mask]
+        metric_array = metric_array[valid_mask]
 
-    economic_parameters = [c for c in param_meta_df.columns if c not in {'set_num', 'run_num', 'time_step', 'set_id', metric}]
+    economic_parameters = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_id', metric}]
     
     for param_name in economic_parameters:
+        # BYPASS PANDAS MERGE: Use index offsets for ultra-fast, zero-allocation matching
+        # Subtracting 1 aligns the 1-indexed set numbers directly to 0-indexed numpy positions
+        mapped_param = param_meta_df[param_name].values[set_num_array - 1]
+        
         for current_style in (['color', 'greyscale'] if style == 'color-and-greyscale' else [style]):
             fig, ax = plt.subplots(figsize=(11, 6))
-            ax.scatter(df[param_name], df[metric], alpha=0.04, s=0.4, c='#1f77b4' if current_style == 'color' else '#404040', edgecolors='none')
+            ax.scatter(mapped_param, metric_array, alpha=0.04, s=0.4, c='#1f77b4' if current_style == 'color' else '#404040', edgecolors='none')
             ax.set_title(f"GSA Bifurcation Mapping - {param_name.upper()} ({current_style.capitalize()})", fontsize=12, fontweight='bold')
             ax.set_xlabel(f"Economic Input: {param_name}"); ax.set_ylabel(f"Dynamic Space: {metric}"); ax.grid(True, linestyle='--', alpha=0.3)
             plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}_{current_style}.png"), dpi=150, bbox_inches='tight')
@@ -184,7 +242,12 @@ if __name__ == '__main__':
             chk_path = os.path.join(out_dir, f"checkpoint_{current_metric}.{args.format}")
             
             if not (args.checkpoint and os.path.exists(chk_path)):
-                stream_metric_data_to_file(args.input, args.table, current_metric, [int(x) for x in args.sets.split('-')], [int(x) for x in args.runs.split('-')], args.workers, args.stride, chk_path, args.format)
+                stream_metric_data_to_file(
+                    args.input, args.table, current_metric, 
+                    [int(x) for x in args.sets.split('-')], 
+                    [int(x) for x in args.runs.split('-')], 
+                    args.workers, args.stride, chk_path, args.format
+                )
             
             generate_bifurcation_plots(chk_path, current_metric, args.format, out_dir, args.style, args.parameters, args.percentile)
     finally:

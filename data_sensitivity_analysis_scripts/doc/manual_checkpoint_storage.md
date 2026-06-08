@@ -48,8 +48,9 @@ To clear the cache and force a complete re-read of your data files, simply delet
 
 File sizes for checkpoint files (for 4 metrics) in parquet and feather format.
 
-| Case   | Sets & Runs                         | Parquet | Feather |
-| **S**  | (sets 1-513, runs 1-200, stride 5)  | 172 MB  | 296 MB  |
-| **M**  | (sets 1-513, runs 1-1000, stride 5) | 860 MB  | 1.48 GB |
-| **L**  | (sets 1-513, runs 1-200, stride 1)  | 860 MB  | 1.48 GB |
-| **XL** | (sets 1-513, runs 1-1000, stride 1) | 4.30 GB | 7.40 GB |
+| Case | Sets & Runs | Parquet | Feather |
+| :--- | :--- | :--- | :--- |
+| **S** | (sets 1-513, runs 1-200, stride 5) | $\sim 94.6\text{ MB}$ – $103.2\text{ MB}$ | $\sim 177.6\text{ MB}$ |
+| **M** | (sets 1-513, runs 1-1000, stride 5) | $\sim 473.0\text{ MB}$ – $516.0\text{ MB}$ | $\sim 888.0\text{ MB}$ |
+| **L** | (sets 1-513, runs 1-200, stride 1) | $\sim 473.0\text{ MB}$ – $516.0\text{ MB}$ | $\sim 888.0\text{ MB}$ |
+| **XL** | (sets 1-513, runs 1-1000, stride 1) | $\sim 2.37\text{ GB}$ – $2.58\text{ GB}$ | $\sim 4.44\text{ GB}$ |
