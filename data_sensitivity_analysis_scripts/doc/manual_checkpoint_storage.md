@@ -1,6 +1,3 @@
-#!/bin/sh
-
-cat << 'EOF' > manual_checkpoint_storage.md
 
 ## Technical Reference: Checkpoint Storage & Lifecycle
 
@@ -56,5 +53,3 @@ File sizes for checkpoint files (for 4 metrics) in parquet and feather format.
 | **M**  | (sets 1-513, runs 1-1000, stride 5) | 860 MB  | 1.48 GB |
 | **L**  | (sets 1-513, runs 1-200, stride 1)  | 860 MB  | 1.48 GB |
 | **XL** | (sets 1-513, runs 1-1000, stride 1) | 4.30 GB | 7.40 GB |
-
-EOF
