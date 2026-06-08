@@ -47,4 +47,13 @@ To clear the cache and force a complete re-read of your data files, simply delet
 
     rm results_dir/unemployment_rate/checkpoint_unemployment_rate.feather
 
+#### Table
+
+Metric,Source Size (Raw Parquet),Cache Size (Processed),Peak RAM Usage
+Unemployment Rate,1.82 GB,212 MB,0.45 GB
+Price Index,1.79 GB,208 MB,0.42 GB
+Total Debt,1.85 GB,215 MB,0.48 GB
+Monthly Output,1.91 GB,222 MB,0.51 GB
+AGGREGATE,7.37 GB,857 MB,0.51 GB (Max)
+
 EOF

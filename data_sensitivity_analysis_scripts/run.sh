@@ -2,23 +2,25 @@
 
 
 INPUT_DIR='/media/sander/FE428397428352F71/Data/Estimation_and_Calibration_Dataset/Data/calibration-data/flat/sets-1-513/pqt'
-OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAME-HPC/xparser@svdhoog/sandbox_parquet_integration/test_models/ABM/calibration_data/output'
+OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_models/ABM/calibration_data/output'
 #OUTPUT_FILE='gsa_summary.txt'
 
-SAMPLE_DIR='/home/sander/Documents/GIT/GitHub/FLAME-HPC/xparser@svdhoog/sandbox_parquet_integration/test_models/ABM/calibration_data'
-SAMPLE_FILE='sample_513_mode_3.csv'
+SAMPLE_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_models/ABM/calibration_data'
+SAMPLE_FILE='sample_513_mode_3_with_headers.csv'
 
-METRICS="unemployment_rate, monthly_output, price_index, total_debt"
-#METRICS="unemployment_rate"
+#METRICS="unemployment_rate, monthly_output, price_index, total_debt"
+METRICS="unemployment_rate"
+#METRICS="monthly_output, price_index, total_debt"
 
 # Usage:
 # python global_sensitivity_analysis.py \
 #	--input ./parquet_output \
-#   --parameters sample_513_mode_3.csv \
+#   --parameters sample_513_mode_3_with_headers.csv \
 #	--table Agent_n \
 #	--metric var_names \
 #   --output "$OUTPUT_DIR/$OUTPUT_FILE" \
 #	--style [color|greyscale|color-and-greyscale] \
+#   --percentile 95
 #	--sets 1-10 \
 #	--runs 1-100 \
 #	--workers 4 \
@@ -35,9 +37,10 @@ time python global_sensitivity_analysis.py \
     --metric "$METRICS" \
     --output "$OUTPUT_DIR" \
     --style greyscale \
+    --percentile 99 \
     --sets 1-513 \
-    --runs 1-200 \
-    --workers 1 \
-    --stride 5 \
+    --runs 1-1000 \
+    --workers 2 \
+    --stride 1 \
     --checkpoint \
-    --format 'parquet'
+    --format 'feather'

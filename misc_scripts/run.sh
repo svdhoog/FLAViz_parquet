@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SRC_LOCAL='/home/sander/Documents/GIT/GitHub/FLAME-HPC/xparser@svdhoog/sandbox_parquet_integration/test_data/flat'
+SRC_LOCAL='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_data/flat'
 SRC_BKUP='/media/sander/FE428397428352F71/Data/Estimation_and_Calibration_Dataset/Data/calibration-data'
 
 SUB_1='sets-1-256/calibration-mode-3-stage-1-sets-1-256-tarballs-part-1/tarballs'
