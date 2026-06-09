@@ -4,6 +4,7 @@
 Global Sensitivity Analysis (GSA) & Isolated Bifurcation Engine
 ================================================================================
 DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
+
     1. [Shift to Bifurcation Mapping]: Preserves every individual stochastic 
        run against the parameter continuum to uncover phase transitions.
        
@@ -30,8 +31,12 @@ DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
        floating-point analytical columns to instantly half computational memory layouts.
        
     8. [Two-Pass Streaming Plotting]: Eliminates monolithic table materialization 
-       by decoupling percentile threshold calculation and rendering into separate, 
-       low-memory iterative batch passes.
+       by decoupling percentile threshold calculation (via sampling) from rendering.
+
+    9. [Streaming Histogram Accumulation]: Updates a static 500x500 grid buffer 
+       batch-by-batch. This architecture decouples memory usage from dataset size, 
+       ensuring that RAM usage remains flat regardless of whether the dataset 
+       is 1 GB or 100 GB.
 """
 
 import os, re, gc, sys, time, argparse, glob, threading, multiprocessing
@@ -47,10 +52,8 @@ import matplotlib.colors as mcolors
 class LiveMemoryProfiler(threading.Thread):
     def __init__(self, log_path="gsa_memory_profile.csv", interval_sec=2.0):
         super().__init__()
-        self.log_path = log_path
-        self.interval_sec = interval_sec
-        self.daemon = True
-        self.is_running = True
+        self.log_path = log_path; self.interval_sec = interval_sec
+        self.daemon = True; self.is_running = True
     def run(self):
         process = psutil.Process(os.getpid())
         while self.is_running:
@@ -76,7 +79,7 @@ def read_single_parquet_raw_stream(args):
             y_raw = raw_batch.column(metric).to_numpy().astype(np.float32)
             if stride > 1: y_raw = y_raw[::stride]
             if len(y_raw) > 0: processed_chunks.append(y_raw)
-        return {'set_id': set_id, 'run_id': run_id, 'y': np.concatenate(processed_chunks)} if processed_chunks else None
+        return {'set_id': set_id, 'y': np.concatenate(processed_chunks)} if processed_chunks else None
     except: return None
 
 def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type):
@@ -114,30 +117,37 @@ def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir,
     param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
     param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
     
+    # Pass 1: Percentile threshold via streaming sample (1M points max)
+    sample_points = []
     it, _ = get_iterator(checkpoint_path, format_type, [metric])
-    all_vals = np.concatenate([batch.column(metric).to_numpy() for batch in it])
-    threshold = np.percentile(all_vals, percentile_limit) if percentile_limit < 100 else np.max(all_vals)
-    del all_vals; gc.collect()
+    for batch in it:
+        sample_points.append(batch.column(metric).to_numpy())
+        if sum(len(s) for s in sample_points) > 1_000_000: break
+    threshold = np.percentile(np.concatenate(sample_points), percentile_limit)
+    del sample_points; gc.collect()
 
     economic_params = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_id', metric}]
     for param_name in economic_params:
         param_vector = param_meta_df[param_name].values.astype(np.float32)
-        plot_x, plot_y = [], []
+        # Initialize streaming histogram grid (500x500)
+        hist_grid = np.zeros((500, 500))
+        x_edges = np.linspace(param_vector.min(), param_vector.max(), 501)
+        y_edges = np.linspace(0, threshold, 501)
+        
         it, source = get_iterator(checkpoint_path, format_type, ['set_num', metric])
         for batch in it:
-            sets, vals = batch.column('set_num').to_numpy(), batch.column(metric).to_numpy()
-            mask = vals <= threshold
+            sets = batch.column('set_num').to_numpy()
+            vals = batch.column(metric).to_numpy()
+            mask = (vals <= threshold) & (vals >= 0)
             if np.any(mask):
-                plot_x.append(param_vector[sets[mask] - 1]); plot_y.append(vals[mask])
+                H, _, _ = np.histogram2d(param_vector[sets[mask]-1], vals[mask], bins=[x_edges, y_edges])
+                hist_grid += H
         
-        if plot_x:
-            final_x, final_y = np.concatenate(plot_x), np.concatenate(plot_y)
-            fig, ax = plt.subplots(figsize=(11, 6))
-            if style == 'color': ax.hist2d(final_x, final_y, bins=500, cmap='turbo', norm=mcolors.LogNorm())
-            else: ax.scatter(final_x, final_y, alpha=0.04, s=0.4)
-            plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}.png")); plt.close('all')
-        if source: source.close()
-        gc.collect()
+        fig, ax = plt.subplots(figsize=(11, 6))
+        im = ax.imshow(hist_grid.T, origin='lower', extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]], 
+                       cmap='turbo', norm=mcolors.LogNorm(vmin=1, vmax=hist_grid.max() or 1), aspect='auto')
+        plt.colorbar(im, ax=ax); plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}.png")); plt.close('all')
+        if source: source.close(); gc.collect()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
