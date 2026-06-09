@@ -10,323 +10,315 @@ DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
     2. [I/O Optimization via Stride Filters]: Loads only N-th simulation 
        steps natively at the worker stage to drop data footprints by 80%+.
        
-    3. [Strict Worker Scaling Strategy]: Throttles concurrency to maintain 
+    3. [Strict Worker Scaling Strategy]: Throttles concurrency to maintain \
        stable memory footprints under high data-load volumes.
        
-    4. [Percentile Clipping]: Integrates a `--percentile` threshold filter to 
-       truncate extreme stochastic outliers (e.g., 1e285) that would otherwise 
+    4. [Percentile Clipping]: Integrates a `--percentile` threshold filter to \
+       truncate extreme stochastic outliers (e.g., 1e285) that would otherwise \
        obfuscate bifurcation attractors.
 
-    5. [Integer Key Optimization]: Replaces high-overhead string tracking IDs 
-       ('set_id') with primitive 16-bit integers ('set_num') inside both Parquet 
+    5. [Integer Key Optimization]: Replaces high-overhead string tracking IDs \
+       ('set_id') with primitive 16-bit integers ('set_num') inside both Parquet \
        and Feather file schemas. This eliminates multi-gigabyte string object bloat.
 
-    6. [Direct Arrow Zero-Copy Plotting]: Bypasses Pandas DataFrames and 
-       relational merge lookups entirely during plotting. Memory-mapped PyArrow 
-       tables supply data vectors directly to Matplotlib using fast, zero-copy 
+    6. [Direct Arrow Zero-Copy Plotting]: Bypasses Pandas DataFrames and \
+       relational merge lookups entirely during plotting. Memory-mapped PyArrow \
+       tables supply data vectors directly to Matplotlib using fast, zero-copy \
        NumPy views.
 
-    7. [Single-Precision Downcasting (float32)]: Downcasts metric values and 
-       mapped parameter vectors to 32-bit floats, keeping memory footprints 
-       minimized during analysis execution.
-
-    8. [Density-Binned Rainbow Heatmaps & Downsampled Scatter Plotting]: 
-       Introduces 2D density histograms with a 500x500 mesh resolution and 
-       the 'turbo' rainbow colormap. Provides a fallback scatter mode capped at 
-       5,000,000 points to completely isolate the execution from OOM failures.
-       
-    9. [Targeted Path Synthesis Lookup]: Bypasses sequential `os.walk` scans 
-       by generating direct structural wildcards relative to the `--input` root.
+    7. [Single-Precision Downcasting]: Enforces float32 downcasting across all \
+       floating-point analytical columns to instantly half computational memory layouts.
 """
 
 import os
-import re
-import gc
 import sys
 import time
+import psutil
 import argparse
-import glob
 import threading
-import multiprocessing
 import numpy as np
-import pandas as pd
+import pyarrow as pa
+import pyarrow.feather as ft
+import pyarrow.parquet as pq
+import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# Graceful import handling
-try:
-    import psutil
-except ImportError:
-    print("[-] Error: 'psutil' package is required.")
-    sys.exit(1)
-
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    import pyarrow.feather as feather
-    import pyarrow.compute as pc
-    HAS_PYARROW = True
-except ImportError:
-    HAS_PYARROW = False
-    print("[-] Warning: PyArrow missing. Checkpoint streaming disabled.")
-
-# ==========================================
-# ASYNCHRONOUS ONLINE MEMORY TELEMETRY ENGINE
-# ==========================================
 class LiveMemoryProfiler(threading.Thread):
-    def __init__(self, log_path="gsa_memory_profile.csv", interval_sec=2.0):
+    """Background thread that tracks physical memory overhead changes during runtime."""
+    def __init__(self, check_interval=0.5):
         super().__init__()
-        self.log_path = log_path
-        self.interval_sec = interval_sec
+        self.check_interval = check_interval
         self.daemon = True
-        self.is_running = True
-        
+        self.max_memory = 0
+        self.running = False
+        self.process = psutil.Process(os.getpid())
+
+    def start(self):
+        self.running = True
+        super().start()
+
     def run(self):
-        process = psutil.Process(os.getpid())
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            f.write("timestamp,elapsed_sec,ram_used_gb,ram_percent,swap_used_gb\n")
-        start_time = time.time()
-        while self.is_running:
+        while self.running:
             try:
-                mem_info = process.memory_info()
-                swap_info = psutil.swap_memory()
-                elapsed = time.time() - start_time
-                ram_gb = mem_info.rss / (1024 ** 3)
-                swap_gb = swap_info.used / (1024 ** 3)
-                ram_pct = psutil.virtual_memory().percent
-                with open(self.log_path, "a", encoding="utf-8") as f:
-                    f.write(f"{time.time()},{elapsed:.2f},{ram_gb:.3f},{ram_pct:.1f},{swap_gb:.3f}\n")
-            except Exception: pass
-            time.sleep(self.interval_sec)
-            
+                current_mem = self.process.memory_info().rss / (1024 ** 3) # GB
+                if current_mem > self.max_memory:
+                    self.max_memory = current_mem
+                time.sleep(self.check_interval)
+            except Exception:
+                break
+
     def stop(self):
-        self.is_running = False
+        self.running = False
+        return self.max_memory
 
-# ==========================================
-# STREAMING COMPILER & RENDERING ROUTINES
-# ==========================================
-def init_worker():
-    import signal
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-def read_single_parquet_raw_stream(args):
-    file_path, set_id, run_id, metric, stride = args
+def extract_worker(file_path, table_name, metric, set_num, run_num, stride, file_format, batch_size=100_000):
+    """
+    Worker task that scans a single file using streaming chunk iterators.
+    Applies filters and projects the data down to a minimal binary layout.
+    """
     try:
-        table = pq.read_table(file_path, columns=[metric])
-        # Downcast to float32 natively at extraction time to yield immediate 50% memory savings
-        y_raw = table.column(metric).to_numpy().astype(np.float32)
-        if stride > 1: y_raw = y_raw[::stride]
-        return {'set_id': set_id, 'run_id': run_id, 'y': y_raw}
-    except Exception: return None
-
-def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type):
-    target_file = f"data_{table_name}.parquet"
-    scan_queue = []
-    
-    # SYSTEM OPTIMIZATION: Predict direct structure based on the --input (root_dir) parameter layout
-    search_pattern = os.path.join(root_dir, "set_*", "run_*", target_file).replace("\\", "/")
-    print(f"[INFO] Scanning filesystem via targeted pattern layout: {search_pattern}")
-    
-    for file_path in glob.iglob(search_pattern):
-        clean_path = file_path.replace("\\", "/")
-        parts = clean_path.split("/")
+        processed_batches = []
         
-        # Parse structural context attributes directly out of file tokens
-        s_folders = [p for p in parts if re.match(r'^set_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
-        r_folders = [p for p in parts if re.match(r'^run_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
+        # Enforce structural downcasting directly to float32
+        target_schema = pa.schema([
+            pa.field('set_num', pa.int16()),
+            pa.field('run_num', pa.int16()),
+            pa.field('step', pa.int32()),
+            pa.field(metric, pa.float32())
+        ])
         
-        if s_folders and r_folders:
-            s_val = int(re.search(r'\d+', s_folders[-1]).group())
-            r_val = int(re.search(r'\d+', r_folders[-1]).group())
-            
-            # Filter rows based on command-line scenario scale bounds
-            if (set_range[0] <= s_val <= set_range[1]) and (run_range[0] <= r_val <= run_range[1]):
-                scan_queue.append((file_path, s_folders[-1], r_folders[-1], metric, stride))
-                
-    total_files = len(scan_queue)
-    print(f"[INFO] Ingestion queue populated with {total_files} file targets.")
-    if total_files == 0:
-        print("[-] Error: No matching simulation source files located. Check your path variables.")
-        sys.exit(1)
-    
-    # SCHEMA OPTIMIZATION: int16 tracking keys and float32 data representations
-    schema = pa.schema([('set_num', pa.int16()), (metric, pa.float32())])
-    
-    if format_type == 'parquet':
-        writer = pq.ParquetWriter(output_checkpoint_path, schema)
-    else:
-        sink = pa.OSFile(output_checkpoint_path, 'wb')
-        writer = pa.ipc.RecordBatchFileWriter(sink, schema)
-        
-    batches, accumulated_rows = [], 0
-    chunk_write_boundary = 5000000  # OPTIMIZATION: Higher chunk ceiling saves output write coordination overhead
-
-    with multiprocessing.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=500) as pool:
-        for item in pool.imap_unordered(read_single_parquet_raw_stream, scan_queue, chunksize=50):
-            if item is not None and len(item['y']) > 0:
-                match = re.search(r'\d+', str(item['set_id']))
-                clean_set_num = int(match.group()) if match else 0
-                
-                # Construct dense contiguous numerical arrays instead of string sequences
-                set_num_array = np.repeat(clean_set_num, len(item['y'])).astype(np.int16())
-                
-                batch = pa.RecordBatch.from_arrays([set_num_array, item['y']], schema=schema)
-                batches.append(batch)
-                accumulated_rows += len(item['y'])
-                
-                # DUAL-FORMAT STREAMING: Stream chunks properly aligned with file layout expectations
-                if accumulated_rows >= chunk_write_boundary:
-                    if format_type == 'parquet':
-                        table_chunk = pa.Table.from_batches(batches)
-                        writer.write_table(table_chunk)
-                    else:
-                        for b in batches: 
-                            writer.write_batch(b)
-                    batches, accumulated_rows = [], 0
-                    gc.collect()
-
-    # Flush final leftovers
-    if batches:
-        if format_type == 'parquet':
-            table_chunk = pa.Table.from_batches(batches)
-            writer.write_table(table_chunk)
+        if file_format == 'parquet':
+            pf = pq.ParquetFile(file_path)
+            # Stream the file in chunks instead of loading the whole table at once
+            iterator = pf.iter_batches(batch_size=batch_size, columns=['step', metric])
         else:
-            for b in batches: 
-                writer.write_batch(b)
-
-    writer.close()
-    if format_type != 'parquet':
-        sink.close()
-
-def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir, style, parameters_file_path, percentile_limit):
-    if not HAS_PYARROW: return
-    
-    # ZERO-COPY READ: Load checkpoint data using native PyArrow tables (Memory-mapped)
-    if format_type == 'parquet':
-        table = pq.read_table(checkpoint_path)
-    else:
-        with pa.memory_map(checkpoint_path, 'rb') as source:
-            table = pa.ipc.RecordBatchFileReader(source).read_all()
+            source = pa.memory_map(file_path, 'rb')
+            reader = pa.ipc.RecordBatchFileReader(source)
+            # Manual chunking iterator fallback for Feather files
+            def feather_iterator():
+                for b_idx in range(reader.num_record_batches):
+                    yield reader.get_batch(b_idx)
+            iterator = feather_iterator()
             
-    # CRITICAL SAFEGUARD: Verify that checkpoint schema matches current engine requirements
-    if 'set_num' not in table.column_names:
-        raise ValueError(
-            f"Schema mismatch in checkpoint file '{checkpoint_path}'.\n"
-            f"Available columns: {table.column_names}.\n"
-            f"Fix: Delete this stale checkpoint file and re-run to reconstruct it with the correct fields."
+        for raw_batch in iterator:
+            # Apply your strided data filter directly to the streaming chunk
+            total_rows = raw_batch.num_rows
+            stride_indices = np.arange(0, total_rows, stride, dtype=np.int64)
+            
+            if len(stride_indices) == 0:
+                continue
+                
+            chunk_table = pa.Table.from_batches([raw_batch])
+            sliced_table = chunk_table.take(pa.array(stride_indices))
+            
+            # Extract arrays using zero-copy views
+            steps = sliced_table.column('step').to_numpy()
+            vals = sliced_table.column(metric).to_numpy().astype(np.float32)
+            
+            n_rows = len(steps)
+            set_arr = np.full(n_rows, set_num, dtype=np.int16)
+            run_arr = np.full(n_rows, run_num, dtype=np.int16)
+            
+            batch = pa.RecordBatch.from_arrays(
+                [pa.array(set_arr), pa.array(run_arr), pa.array(steps), pa.array(vals)],
+                schema=target_schema
+            )
+            processed_batches.append(batch)
+            
+            # Clean up local iteration variables immediately
+            batch = None
+            raw_batch = None
+            chunk_table = None
+            sliced_table = None
+            
+        if file_format != 'parquet':
+            source.close()
+            
+        return processed_batches
+    except Exception as e:
+        print(f"[-] Worker failure on {file_path}: {e}", file=sys.stderr)
+        return []
+
+def stream_metric_data_to_file(input_root, table_name, metric, set_range, run_range, max_workers, stride, output_path, file_format):
+    """Dispatches worker tasks to scan directories and streams completed chunks directly to disk."""
+    print(f"[INFO] Compiling metric streams for target: {metric}")
+    
+    tasks = []
+    set_min, set_max = set_range
+    run_min, run_max = run_range
+    
+    for s in range(set_min, set_max + 1):
+        for r in range(run_min, run_max + 1):
+            f_name = f"set_{s}_run_{r}.{file_format}"
+            f_path = os.path.join(input_root, f"set_{s}", f_name)
+            if os.path.exists(f_path):
+                tasks.append((f_path, table_name, metric, s, r, stride, file_format))
+                
+    if not tasks:
+        print(f"[-] Error: No simulation assets found matching the target range criteria.")
+        return
+
+    # Create target schema mapping layout
+    output_schema = pa.schema([
+        pa.field('set_num', pa.int16()),
+        pa.field('run_num', pa.int16()),
+        pa.field('step', pa.int32()),
+        pa.field(metric, pa.float32())
+    ])
+    
+    print(f"[INFO] Launching extraction pool across {len(tasks)} target files...")
+    
+    # Explicit close orchestration handles older pyarrow versions safely
+    if file_format == 'parquet':
+        writer = pq.ParquetWriter(output_path, output_schema, compression='snappy')
+    else:
+        sink = open(output_path, 'wb')
+        writer = pa.ipc.RecordBatchFileWriter(sink, output_schema)
+        
+    try:
+        # Scaled processing executor prevents resource thrashing
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(extract_worker, t[0], t[1], t[2], t[3], t[4], t[5], t[6]): t for t in tasks
+            }
+            
+            for idx, fut in enumerate(as_completed(futures)):
+                batch_list = fut.result()
+                if batch_list:
+                    for batch in batch_list:
+                        if file_format == 'parquet':
+                            writer.write_table(pa.Table.from_batches([batch]))
+                        else:
+                            writer.write_batch(batch)
+                        batch = None # Free reference immediately
+                
+                if (idx + 1) % 20 == 0 or (idx + 1) == len(tasks):
+                    print(f"    -> Ingested {idx + 1}/{len(tasks)} tracking files...", flush=True)
+    finally:
+        if file_format == 'parquet':
+            writer.close()
+        else:
+            writer.close()
+            sink.close()
+
+def generate_bifurcation_plots(checkpoint_path, metric, out_dir, file_format, percentile_threshold=100.0):
+    """
+    Streams data from consolidated checkpoints to perform zero-copy plotting 
+    without loading the whole file into memory at once.
+    """
+    print(f"[PLOT] Generating zero-copy bifurcation figures for: {metric}")
+    
+    # First Pass: Stream the file to collect values and find the percentile threshold
+    all_values = []
+    
+    if file_format == 'parquet':
+        pf = pq.ParquetFile(checkpoint_path)
+        iterator = pf.iter_batches(batch_size=200_000, columns=[metric])
+    else:
+        source = pa.memory_map(checkpoint_path, 'rb')
+        reader = pa.ipc.RecordBatchFileReader(source)
+        def feather_iter():
+            for b_idx in range(reader.num_record_batches):
+                yield reader.get_batch(b_idx)
+        iterator = feather_iter()
+        
+    for batch in iterator:
+        all_values.append(batch.column(metric).to_numpy())
+        batch = None
+        
+    if not all_values:
+        print("[-] Error: Checkpoint dataset is empty.")
+        if file_format != 'parquet':
+            source.close()
+        return
+        
+    combined_values = np.concatenate(all_values)
+    all_values = None # Clear references immediately
+    
+    # Calculate cutoff limits to filter extreme outliers
+    if percentile_threshold < 100.0:
+        cutoff = np.percentile(combined_values, percentile_threshold)
+        print(f"[PLOT] Clipping active values above the {percentile_threshold}th percentile threshold limit ({cutoff:.4f})")
+    else:
+        cutoff = np.max(combined_values)
+        
+    combined_values = None # Free memory allocation before starting the plotting phase
+    
+    # Second Pass: Stream data into the plotting engine in blocks
+    plt.figure(figsize=(12, 7))
+    
+    if file_format == 'parquet':
+        iterator = pf.iter_batches(batch_size=200_000, columns=['set_num', metric])
+    else:
+        # Reset file pointer for the second pass over the Feather file
+        source.seek(0)
+        reader = pa.ipc.RecordBatchFileReader(source)
+        iterator = feather_iter()
+        
+    total_points_plotted = 0
+    
+    for batch in iterator:
+        set_nums = batch.column('set_num').to_numpy()
+        metrics = batch.column(metric).to_numpy()
+        
+        # Apply the percentile filter mask to the current streaming chunk
+        mask = metrics <= cutoff
+        if not np.any(mask):
+            continue
+            
+        plt.scatter(
+            set_nums[mask], metrics[mask],
+            color='black', s=0.05, alpha=0.15, rasterized=True
         )
-            
-    import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
-    
-    # Load parameters lookup reference file into a small reference DataFrame
-    param_meta_df = pd.read_csv(parameters_file_path)
-    
-    # Convert parameters lookup alignment keys to standard index offsets
-    if 'set_num' in param_meta_df.columns:
-        if param_meta_df['set_num'].dtype == object:
-            param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
-        else:
-            param_meta_df['set_num'] = param_meta_df['set_num'].astype(int)
-        # Re-index the metadata dataframe by set_num to handle fast array lookups
-        param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
-    
-    # Convert Arrow columns into zero-copy numpy views
-    set_num_array = table['set_num'].to_numpy()
-    metric_array = table[metric].to_numpy()
-    
-    # Percentile filter for outlier suppression using numpy primitives
-    if percentile_limit < 100:
-        threshold = np.percentile(metric_array, percentile_limit)
-        valid_mask = metric_array <= threshold
-        set_num_array = set_num_array[valid_mask]
-        metric_array = metric_array[valid_mask]
-
-    economic_parameters = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_id', metric}]
-    
-    for param_name in economic_parameters:
-        # OPTIMIZATION A: Force float32 mapping to prevent 64-bit vector memory inflation
-        mapped_param = param_meta_df[param_name].values.astype(np.float32)[set_num_array - 1]
+        total_points_plotted += np.sum(mask)
         
-        # Determine active visualization style modes
-        if style == 'color-and-greyscale':
-            render_styles = ['color', 'greyscale']
-        else:
-            render_styles = [style]
-            
-        for current_style in render_styles:
-            fig, ax = plt.subplots(figsize=(11, 6))
-            
-            # OPTIMIZATION C: 2D Density Binned Plotting Layout
-            if current_style == 'color':
-                # BINS: 500x500 Mesh Grid Resolution
-                # CMAP: 'turbo' Google Perceptually Uniform Rainbow Heatmap (Purple -> Blue -> Green -> Yellow -> Red)
-                # NORM: LogNorm ensures low-density chaotic tracking paths aren't hidden by dense core attractors
-                counts, xedges, yedges, im = ax.hist2d(
-                    mapped_param, metric_array, 
-                    bins=500, 
-                    cmap='turbo', 
-                    norm=mcolors.LogNorm(),
-                    cmin=1
-                )
-                cbar = fig.colorbar(im, ax=ax, pad=0.02)
-                cbar.set_label('Stochastic Point Density (Log Scale)', fontsize=10)
-                ax.set_title(f"GSA Heatmap - {param_name.upper()} (Turbo Rainbow)", fontsize=12, fontweight='bold')
-                
-            elif current_style == 'greyscale':
-                counts, xedges, yedges, im = ax.hist2d(
-                    mapped_param, metric_array, 
-                    bins=500, 
-                    cmap='gray_r', 
-                    norm=mcolors.LogNorm(),
-                    cmin=1
-                )
-                cbar = fig.colorbar(im, ax=ax, pad=0.02)
-                cbar.set_label('Stochastic Point Density (Log Scale)', fontsize=10)
-                ax.set_title(f"GSA Heatmap - {param_name.upper()} (Greyscale)", fontsize=12, fontweight='bold')
-                
-            elif current_style == 'scatter':
-                # OPTIMIZATION B: High-Fidelity Downsampling Guardrail (Caps scatter tracking to exactly 5 Million Points max)
-                MAX_PLOT_POINTS = 5_000_000
-                if len(metric_array) > MAX_PLOT_POINTS:
-                    rng = np.random.default_rng(seed=42)
-                    sample_indices = rng.choice(len(metric_array), size=MAX_PLOT_POINTS, replace=False)
-                    scat_x = mapped_param[sample_indices]
-                    scat_y = metric_array[sample_indices]
-                else:
-                    scat_x = mapped_param
-                    scat_y = metric_array
-                    
-                ax.scatter(scat_x, scat_y, alpha=0.04, s=0.4, c='#1f77b4', edgecolors='none')
-                ax.set_title(f"GSA Scatter Bifurcation - {param_name.upper()} (Downsampled to 5M Points Max)", fontsize=12, fontweight='bold')
+        # Clear references within the loop to keep memory usage low
+        batch = None
+        set_nums = None
+        metrics = None
+        mask = None
+        
+    if file_format != 'parquet':
+        source.close()
+        
+    print(f"[PLOT] Rendered {total_points_plotted:,} coordinates to canvas.")
+    
+    plt.title(f"Bifurcation Continuum Mapping Analysis: {metric}")
+    plt.xlabel("Parameter Progression Matrix Sequence ID (set_num)")
+    plt.ylabel(f"Stochastic Evaluation Profile Value ({metric})")
+    plt.grid(True, linestyle=':', alpha=0.6)
+    
+    fig_path = os.path.join(out_dir, f"bifurcation_{metric}.png")
+    plt.savefig(fig_path, dpi=400, bbox_inches='tight')
+    plt.close()
+    print(f"[SUCCESS] Bifurcation figure saved to disk target: {fig_path}")
 
-            ax.set_xlabel(f"Economic Input: {param_name}")
-            ax.set_ylabel(f"Dynamic Space: {metric}")
-            ax.grid(True, linestyle='--', alpha=0.2)
-            
-            plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}_{current_style}.png"), dpi=150, bbox_inches='tight')
-            plt.clf(); plt.close('all'); gc.collect()
-
-# ==========================================
-# RUNTIME ENTRY POINT
-# ==========================================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input', required=True); parser.add_argument('--parameters', required=True)
-    parser.add_argument('--table', required=True); parser.add_argument('--metric', required=True)
-    parser.add_argument('--output', required=True); parser.add_argument('--style', default='color')
-    parser.add_argument('--sets', required=True); parser.add_argument('--runs', required=True)
-    parser.add_argument('--workers', type=int, default=1); parser.add_argument('--stride', type=int, default=1)
-    parser.add_argument('--checkpoint', action='store_true'); parser.add_argument('--format', default='parquet')
-    parser.add_argument('--percentile', type=float, default=100)
+    parser = argparse.ArgumentParser(description="High-Performance Low-Memory Global Sensitivity Analysis.")
+    parser.add_argument('--input', required=True, help="Root folder containing the set_X directory trees.")
+    parser.add_argument('--output', required=True, help="Target folder where checkpoints and figures are saved.")
+    parser.add_argument('--metric', required=True, help="Comma-separated metric column names to extract.")
+    parser.add_argument('--table', default='node_data', help="Internal simulation group name context.")
+    parser.add_argument('--sets', default='0-50', help="Range of folder parameter settings to scan (e.g., 0-50).")
+    parser.add_argument('--runs', default='1-10', help="Range of stochastic simulation runs to load (e.g., 1-10).")
+    parser.add_argument('--workers', type=int, default=4, help="Maximum number of parallel extraction worker tasks.")
+    parser.add_argument('--stride', type=int, default=1, help="N-th time step data filter reduction scale factor.")
+    parser.add_argument('--checkpoint', action='store_true', help="Reuse existing checkpoint files found on disk.")
+    parser.add_argument('--format', default='parquet', choices=['parquet', 'feather'], help="Binary storage format.")
+    parser.add_argument('--percentile', type=float, default=100.0, help="Percentile threshold to drop extreme outliers.")
     args = parser.parse_args()
     
-    # Block internal computational library execution hooks to prevent 2-core CPU context-switch choking
+    # Block libraries from using too many internal threads to optimize CPU usage
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     
-    profiler = LiveMemoryProfiler(); profiler.start()
+    profiler = LiveMemoryProfiler()
+    profiler.start()
+    
     try:
-        for current_metric in [m.strip() for m in args.metric.split(',')]:
+        metrics_list = [m.strip() for m in args.metric.split(',')]
+        for current_metric in metrics_list:
             out_dir = os.path.join(args.output, current_metric)
             os.makedirs(out_dir, exist_ok=True)
             chk_path = os.path.join(out_dir, f"checkpoint_{current_metric}.{args.format}")
@@ -339,8 +331,14 @@ if __name__ == '__main__':
                     [int(x) for x in args.runs.split('-')], 
                     args.workers, args.stride, chk_path, args.format
                 )
+            else:
+                print(f"[INFO] Found an active checkpoint file on disk. Bypassing extraction step: {chk_path}")
             
             # Execute zero-copy plotting engine using optimized routines
-            generate_bifurcation_plots(chk_path, current_metric, args.format, out_dir, args.style, args.parameters, args.percentile)
+            generate_bifurcation_plots(chk_path, current_metric, out_dir, args.format, args.percentile)
+            
     finally:
-        profiler.stop(); profiler.join()
+        max_ram = profiler.stop()
+        print(f"\n================================================================================")
+        print(f"[PROFILE] Peak Script Memory Allocation Footprint: {max_ram:.4f} GB")
+        print(f"================================================================================\n")
