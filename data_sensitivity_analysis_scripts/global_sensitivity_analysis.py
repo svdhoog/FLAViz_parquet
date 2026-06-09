@@ -26,55 +26,24 @@ DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
        tables supply data vectors directly to Matplotlib using fast, zero-copy 
        NumPy views.
 
-    7. [Single-Precision Downcasting (float32)]: Downcasts metric values and 
-       mapped parameter vectors to 32-bit floats, keeping memory footprints 
-       minimized during analysis execution.
-
-    8. [Density-Binned Rainbow Heatmaps & Downsampled Scatter Plotting]: 
-       Introduces 2D density histograms with a 500x500 mesh resolution and 
-       the 'turbo' rainbow colormap. Provides a fallback scatter mode capped at 
-       5,000,000 points to completely isolate the execution from OOM failures.
+    7. [Single-Precision Downcasting]: Enforces float32 downcasting across all 
+       floating-point analytical columns to instantly half computational memory layouts.
        
-    9. [Targeted Path Synthesis Lookup]: Bypasses sequential `os.walk` scans 
-       by generating direct structural wildcards relative to the `--input` root.
-       
-   10. [True Streaming Ingestion]: Refactored file reads and plot calculations 
-       to utilize PyArrow batch streaming loops, eliminating monolithic table 
-       materializations to ensure absolute OOM protection on XL datasets.
+    8. [Two-Pass Streaming Plotting]: Eliminates monolithic table materialization 
+       by decoupling percentile threshold calculation and rendering into separate, 
+       low-memory iterative batch passes.
 """
 
-import os
-import re
-import gc
-import sys
-import time
-import argparse
-import glob
-import threading
-import multiprocessing
+import os, re, gc, sys, time, argparse, glob, threading, multiprocessing
 import numpy as np
 import pandas as pd
+import psutil
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.ipc as ipc
+import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
-# Graceful import handling
-try:
-    import psutil
-except ImportError:
-    print("[-] Error: 'psutil' package is required.")
-    sys.exit(1)
-
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    import pyarrow.feather as feather
-    import pyarrow.compute as pc
-    HAS_PYARROW = True
-except ImportError:
-    HAS_PYARROW = False
-    print("[-] Warning: PyArrow missing. Checkpoint streaming disabled.")
-
-# ==========================================
-# ASYNCHRONOUS ONLINE MEMORY TELEMETRY ENGINE
-# ==========================================
 class LiveMemoryProfiler(threading.Thread):
     def __init__(self, log_path="gsa_memory_profile.csv", interval_sec=2.0):
         super().__init__()
@@ -82,259 +51,94 @@ class LiveMemoryProfiler(threading.Thread):
         self.interval_sec = interval_sec
         self.daemon = True
         self.is_running = True
-        
     def run(self):
         process = psutil.Process(os.getpid())
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            f.write("timestamp,elapsed_sec,ram_used_gb,ram_percent,swap_used_gb\n")
-        start_time = time.time()
         while self.is_running:
             try:
-                mem_info = process.memory_info()
-                swap_info = psutil.swap_memory()
-                elapsed = time.time() - start_time
-                ram_gb = mem_info.rss / (1024 ** 3)
-                swap_gb = swap_info.used / (1024 ** 3)
-                ram_pct = psutil.virtual_memory().percent
-                with open(self.log_path, "a", encoding="utf-8") as f:
-                    f.write(f"{time.time()},{elapsed:.2f},{ram_gb:.3f},{ram_pct:.1f},{swap_gb:.3f}\n")
-            except Exception: pass
+                ram_gb = process.memory_info().rss / (1024 ** 3)
+                swap_gb = psutil.swap_memory().used / (1024 ** 3)
+                with open(self.log_path, "a") as f:
+                    f.write(f"{time.time()},{ram_gb:.3f},{swap_gb:.3f}\n")
+            except: pass
             time.sleep(self.interval_sec)
-            
-    def stop(self):
-        self.is_running = False
+    def stop(self): self.is_running = False
 
-# ==========================================
-# STREAMING COMPILER & RENDERING ROUTINES
-# ==========================================
 def init_worker():
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 def read_single_parquet_raw_stream(args):
-    """Worker task that streams file records chunk-by-chunk using low-overhead iterators."""
     file_path, set_id, run_id, metric, stride = args
     try:
         processed_chunks = []
         pf = pq.ParquetFile(file_path)
-        
-        # Stream the file using low-memory batches instead of materializing the entire table
         for raw_batch in pf.iter_batches(batch_size=100_000, columns=[metric]):
             y_raw = raw_batch.column(metric).to_numpy().astype(np.float32)
-            if stride > 1: 
-                y_raw = y_raw[::stride]
-            
-            if len(y_raw) > 0:
-                processed_chunks.append(y_raw)
-            raw_batch = None # Free immediately
-            
-        if not processed_chunks:
-            return None
-            
-        return {'set_id': set_id, 'run_id': run_id, 'y': np.concatenate(processed_chunks)}
-    except Exception: 
-        return None
+            if stride > 1: y_raw = y_raw[::stride]
+            if len(y_raw) > 0: processed_chunks.append(y_raw)
+        return {'set_id': set_id, 'run_id': run_id, 'y': np.concatenate(processed_chunks)} if processed_chunks else None
+    except: return None
 
 def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type):
     target_file = f"data_{table_name}.parquet"
     scan_queue = []
-    
-    search_pattern = os.path.join(root_dir, "set_*", "run_*", target_file).replace("\\", "/")
-    print(f"[INFO] Scanning filesystem via targeted pattern layout: {search_pattern}")
-    
-    for file_path in glob.iglob(search_pattern):
-        clean_path = file_path.replace("\\", "/")
-        parts = clean_path.split("/")
-        
-        s_folders = [p for p in parts if re.match(r'^set_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
-        r_folders = [p for p in parts if re.match(r'^run_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
-        
-        if s_folders and r_folders:
-            s_val = int(re.search(r'\d+', s_folders[-1]).group())
-            r_val = int(re.search(r'\d+', r_folders[-1]).group())
-            
-            if (set_range[0] <= s_val <= set_range[1]) and (run_range[0] <= r_val <= run_range[1]):
-                scan_queue.append((file_path, s_folders[-1], r_folders[-1], metric, stride))
-                
-    total_files = len(scan_queue)
-    print(f"[INFO] Ingestion queue populated with {total_files} file targets.")
-    if total_files == 0:
-        print("[-] Error: No matching simulation source files located. Check your path variables.")
-        sys.exit(1)
+    for file_path in glob.iglob(os.path.join(root_dir, "set_*", "run_*", target_file).replace("\\", "/")):
+        parts = file_path.replace("\\", "/").split("/")
+        s_val = int(re.search(r'\d+', parts[-3]).group())
+        r_val = int(re.search(r'\d+', parts[-2]).group())
+        if (set_range[0] <= s_val <= set_range[1]) and (run_range[0] <= r_val <= run_range[1]):
+            scan_queue.append((file_path, parts[-3], parts[-2], metric, stride))
     
     schema = pa.schema([('set_num', pa.int16()), (metric, pa.float32())])
+    writer = pq.ParquetWriter(output_checkpoint_path, schema) if format_type == 'parquet' else ipc.RecordBatchFileWriter(open(output_checkpoint_path, 'wb'), schema)
     
-    if format_type == 'parquet':
-        writer = pq.ParquetWriter(output_checkpoint_path, schema)
-    else:
-        sink = open(output_checkpoint_path, 'wb')
-        writer = pa.ipc.RecordBatchFileWriter(sink, schema)
-        
-    batches, accumulated_rows = [], 0
-    chunk_write_boundary = 5000000  
-
-    with multiprocessing.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=500) as pool:
-        for item in pool.imap_unordered(read_single_parquet_raw_stream, scan_queue, chunksize=50):
-            if item is not None and len(item['y']) > 0:
-                match = re.search(r'\d+', str(item['set_id']))
-                clean_set_num = int(match.group()) if match else 0
-                
-                set_num_array = np.repeat(clean_set_num, len(item['y'])).astype(np.int16())
-                
-                batch = pa.RecordBatch.from_arrays([set_num_array, item['y']], schema=schema)
-                batches.append(batch)
-                accumulated_rows += len(item['y'])
-                
-                if accumulated_rows >= chunk_write_boundary:
-                    if format_type == 'parquet':
-                        table_chunk = pa.Table.from_batches(batches)
-                        writer.write_table(table_chunk)
-                    else:
-                        for b in batches: 
-                            writer.write_batch(b)
-                    batches, accumulated_rows = [], 0
-                    table_chunk = None
-                    gc.collect()
-
-    if batches:
-        if format_type == 'parquet':
-            table_chunk = pa.Table.from_batches(batches)
-            writer.write_table(table_chunk)
-        else:
-            for b in batches: 
-                writer.write_batch(b)
-
+    with multiprocessing.Pool(processes=num_workers, initializer=init_worker) as pool:
+        for item in pool.imap_unordered(read_single_parquet_raw_stream, scan_queue):
+            if item:
+                set_num = int(re.search(r'\d+', item['set_id']).group())
+                batch = pa.RecordBatch.from_arrays([np.repeat(set_num, len(item['y'])).astype(np.int16), item['y']], schema=schema)
+                if format_type == 'parquet': writer.write_table(pa.Table.from_batches([batch]))
+                else: writer.write_batch(batch)
     writer.close()
-    if format_type != 'parquet':
-        sink.close()
 
-def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir, style, parameters_file_path, percentile_limit):
-    if not HAS_PYARROW: return
-    
-    import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
-    
-    # Load parameters lookup reference file into a small reference DataFrame
-    param_meta_df = pd.read_csv(parameters_file_path)
-    
-    if 'set_num' in param_meta_df.columns:
-        if param_meta_df['set_num'].dtype == object:
-            param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
-        else:
-            param_meta_df['set_num'] = param_meta_df['set_num'].astype(int)
-        param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
-    
-    print(f"[PLOT] Calculating global outliers across checkpoint streams...")
-    
-    # Pass 1: Stream the file to build metric boundaries without full-table materialization
-    all_metrics = []
+def get_iterator(checkpoint_path, format_type, columns):
     if format_type == 'parquet':
-        pf = pq.ParquetFile(checkpoint_path)
-        iterator = pf.iter_batches(batch_size=250_000, columns=[metric])
+        return pq.ParquetFile(checkpoint_path).iter_batches(batch_size=250_000, columns=columns), None
     else:
         source = pa.memory_map(checkpoint_path, 'rb')
-        reader = pa.ipc.RecordBatchFileReader(source)
-        def feather_iter():
-            for b_idx in range(reader.num_record_batches):
-                yield reader.get_batch(b_idx)
-        iterator = feather_iter()
-        
-    for batch in iterator:
-        all_metrics.append(batch.column(metric).to_numpy())
-        batch = None
-        
-    combined_metrics = np.concatenate(all_metrics)
-    all_metrics = None
-    
-    # Identify threshold cutoffs cleanly
-    if percentile_limit < 100:
-        threshold = np.percentile(combined_metrics, percentile_limit)
-        print(f"[PLOT] Clipping active data streams above the {percentile_limit}th percentile: ({threshold:.4f})")
-    else:
-        threshold = np.max(combined_metrics)
-    combined_metrics = None
-    gc.collect()
+        reader = ipc.RecordBatchFileReader(source)
+        return (reader.get_batch(i) for i in range(reader.num_record_batches)), source
 
-    economic_parameters = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_id', metric}]
+def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir, style, parameters_file_path, percentile_limit):
+    param_meta_df = pd.read_csv(parameters_file_path)
+    param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
+    param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
     
-    for param_name in economic_parameters:
-        # Pre-cache parameter vectors downcasted to float32 to reduce overhead
+    it, _ = get_iterator(checkpoint_path, format_type, [metric])
+    all_vals = np.concatenate([batch.column(metric).to_numpy() for batch in it])
+    threshold = np.percentile(all_vals, percentile_limit) if percentile_limit < 100 else np.max(all_vals)
+    del all_vals; gc.collect()
+
+    economic_params = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_id', metric}]
+    for param_name in economic_params:
         param_vector = param_meta_df[param_name].values.astype(np.float32)
+        plot_x, plot_y = [], []
+        it, source = get_iterator(checkpoint_path, format_type, ['set_num', metric])
+        for batch in it:
+            sets, vals = batch.column('set_num').to_numpy(), batch.column(metric).to_numpy()
+            mask = vals <= threshold
+            if np.any(mask):
+                plot_x.append(param_vector[sets[mask] - 1]); plot_y.append(vals[mask])
         
-        if style == 'color-and-greyscale':
-            render_styles = ['color', 'greyscale']
-        else:
-            render_styles = [style]
-            
-        for current_style in render_styles:
-            print(f"[PLOT] Streaming rendering pass for {param_name.upper()} ({current_style})")
-            
-            # Reset chunk iterators for the plotting streaming pass
-            if format_type == 'parquet':
-                iterator = pf.iter_batches(batch_size=250_000, columns=['set_num', metric])
-            else:
-                source.seek(0)
-                reader = pa.ipc.RecordBatchFileReader(source)
-                iterator = feather_iter()
-                
-            plot_x = []
-            plot_y = []
-            
-            for batch in iterator:
-                sets = batch.column('set_num').to_numpy()
-                vals = batch.column(metric).to_numpy()
-                
-                mask = vals <= threshold
-                if np.any(mask):
-                    # Align indices to mapping arrays smoothly
-                    plot_x.append(param_vector[sets[mask] - 1])
-                    plot_y.append(vals[mask])
-                    
-                batch = None; sets = None; vals = None; mask = None
-                
-            if not plot_x:
-                print(f"[-] Warning: No valid points to display for parameter {param_name}")
-                continue
-                
-            final_x = np.concatenate(plot_x)
-            final_y = np.concatenate(plot_y)
-            plot_x = None; plot_y = None
-            
+        if plot_x:
+            final_x, final_y = np.concatenate(plot_x), np.concatenate(plot_y)
             fig, ax = plt.subplots(figsize=(11, 6))
-            
-            if current_style == 'color':
-                ax.hist2d(final_x, final_y, bins=500, cmap='turbo', norm=mcolors.LogNorm(), cmin=1)
-                ax.set_title(f"GSA Heatmap - {param_name.upper()} (Turbo Rainbow)", fontsize=12, fontweight='bold')
-            elif current_style == 'greyscale':
-                ax.hist2d(final_x, final_y, bins=500, cmap='gray_r', norm=mcolors.LogNorm(), cmin=1)
-                ax.set_title(f"GSA Heatmap - {param_name.upper()} (Greyscale)", fontsize=12, fontweight='bold')
-            elif current_style == 'scatter':
-                MAX_PLOT_POINTS = 5_000_000
-                if len(final_y) > MAX_PLOT_POINTS:
-                    rng = np.random.default_rng(seed=42)
-                    idx = rng.choice(len(final_y), size=MAX_PLOT_POINTS, replace=False)
-                    scat_x, scat_y = final_x[idx], final_y[idx]
-                else:
-                    scat_x, scat_y = final_x, final_y
-                    
-                ax.scatter(scat_x, scat_y, alpha=0.04, s=0.4, c='#1f77b4', edgecolors='none')
-                ax.set_title(f"GSA Scatter Bifurcation - {param_name.upper()} (Downsampled)", fontsize=12, fontweight='bold')
+            if style == 'color': ax.hist2d(final_x, final_y, bins=500, cmap='turbo', norm=mcolors.LogNorm())
+            else: ax.scatter(final_x, final_y, alpha=0.04, s=0.4)
+            plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}.png")); plt.close('all')
+        if source: source.close()
+        gc.collect()
 
-            ax.set_xlabel(f"Economic Input: {param_name}")
-            ax.set_ylabel(f"Dynamic Space: {metric}")
-            ax.grid(True, linestyle='--', alpha=0.2)
-            
-            plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}_{current_style}.png"), dpi=150, bbox_inches='tight')
-            plt.clf(); plt.close('all')
-            final_x = None; final_y = None; scat_x = None; scat_y = None
-            gc.collect()
-            
-    if format_type != 'parquet':
-        source.close()
-
-# ==========================================
-# RUNTIME ENTRY POINT
-# ==========================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', required=True); parser.add_argument('--parameters', required=True)
@@ -346,28 +150,14 @@ if __name__ == '__main__':
     parser.add_argument('--percentile', type=float, default=100)
     args = parser.parse_args()
     
-    # Block internal computational library execution hooks to prevent 2-core CPU context-switch choking
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    
+    os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"})
     profiler = LiveMemoryProfiler(); profiler.start()
     try:
         for current_metric in [m.strip() for m in args.metric.split(',')]:
             out_dir = os.path.join(args.output, current_metric)
             os.makedirs(out_dir, exist_ok=True)
             chk_path = os.path.join(out_dir, f"checkpoint_{current_metric}.{args.format}")
-            
-            # Compile metric streams if no valid checkpoint file is found on disk
             if not (args.checkpoint and os.path.exists(chk_path)):
-                stream_metric_data_to_file(
-                    args.input, args.table, current_metric, 
-                    [int(x) for x in args.sets.split('-')], 
-                    [int(x) for x in args.runs.split('-')], 
-                    args.workers, args.stride, chk_path, args.format
-                )
-            
-            # Execute zero-copy plotting engine using optimized routines
+                stream_metric_data_to_file(args.input, args.table, current_metric, [int(x) for x in args.sets.split('-')], [int(x) for x in args.runs.split('-')], args.workers, args.stride, chk_path, args.format)
             generate_bifurcation_plots(chk_path, current_metric, args.format, out_dir, args.style, args.parameters, args.percentile)
-    finally:
-        profiler.stop(); profiler.join()
+    finally: profiler.stop(); profiler.join()
