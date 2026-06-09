@@ -36,7 +36,7 @@ time python global_sensitivity_analysis.py \
     --table Eurostat \
     --metric "$METRICS" \
     --output "$OUTPUT_DIR" \
-    --style greyscale \
+    --style color \
     --percentile 99 \
     --sets 1-513 \
     --runs 1-1000 \

@@ -59,6 +59,6 @@ OUT_1='sets-1-513/db'
 
 ## 5. Tar archive the folder hierarchy of parquet files
 INPUT_DIR='/media/sander/FE428397428352F71/Data/Estimation_and_Calibration_Dataset/Data/calibration-data/flat/sets-1-513/pqt'
-OUTPUT_FILE='/media/sander/FE428397428352F71/Data/Estimation_and_Calibration_Dataset/Data/calibration-data/flat/sets-1-513/calibration-mode-3-stage-1-sets-1-513-tarball-pqt.tar'
+OUTPUT_FILE='/media/sander/FE428397428352F71/Data/Estimation_and_Calibration_Dataset/Data/calibration-data/calibration-mode-3-stage-1-sets-1-513-parquet-files.tar'
 
-tar -cf $INPUT_DIR $OUTPUT_FILE
+tar -cf "$OUTPUT_FILE" "$INPUT_DIR"

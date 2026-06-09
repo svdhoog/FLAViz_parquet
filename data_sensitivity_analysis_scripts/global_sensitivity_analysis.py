@@ -17,20 +17,26 @@ DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
        truncate extreme stochastic outliers (e.g., 1e285) that would otherwise 
        obfuscate bifurcation attractors.
 
-    5. [Integer Key Optimization (Solution 2)]: Replaces high-overhead string 
-       tracking IDs ('set_id') with primitive 16-bit integers ('set_num') inside 
-       both Parquet and Feather file schemas. This eliminates multi-gigabyte 
-       string object bloat during Pandas conversions.
+    5. [Integer Key Optimization]: Replaces high-overhead string tracking IDs 
+       ('set_id') with primitive 16-bit integers ('set_num') inside both Parquet 
+       and Feather file schemas. This eliminates multi-gigabyte string object bloat.
 
-    6. [Direct Arrow Zero-Copy Plotting (Solution 3)]: Bypasses Pandas DataFrames 
-       and relational merge lookups entirely during plotting. Memory-mapped 
-       PyArrow tables supply data vectors directly to Matplotlib using fast, 
-       zero-copy NumPy views.
+    6. [Direct Arrow Zero-Copy Plotting]: Bypasses Pandas DataFrames and 
+       relational merge lookups entirely during plotting. Memory-mapped PyArrow 
+       tables supply data vectors directly to Matplotlib using fast, zero-copy 
+       NumPy views.
 
-    7. [Single-Precision Downcasting (float32)]: Downcasts the metric values 
-       from 64-bit to 32-bit float spaces, dropping the physical storage and 
-       mapping space requirements perfectly in half without compromising the 
-       6-decimal precision requirement.
+    7. [Single-Precision Downcasting (float32)]: Downcasts metric values and 
+       mapped parameter vectors to 32-bit floats, keeping memory footprints 
+       minimized during analysis execution.
+
+    8. [Density-Binned Rainbow Heatmaps & Downsampled Scatter Plotting]: 
+       Introduces 2D density histograms with a 500x500 mesh resolution and 
+       the 'turbo' rainbow colormap. Provides a fallback scatter mode capped at 
+       5,000,000 points to completely isolate the execution from OOM failures.
+       
+    9. [Targeted Path Synthesis Lookup]: Bypasses sequential `os.walk` scans 
+       by generating direct structural wildcards relative to the `--input` root.
 """
 
 import os
@@ -39,6 +45,7 @@ import gc
 import sys
 import time
 import argparse
+import glob
 import threading
 import multiprocessing
 import numpy as np
@@ -113,15 +120,32 @@ def read_single_parquet_raw_stream(args):
 def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type):
     target_file = f"data_{table_name}.parquet"
     scan_queue = []
-    for root, _, files in os.walk(root_dir):
-        if target_file in files:
-            parts = root.replace("\\", "/").split("/")
-            s = [p for p in parts if re.match(r'^set_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
-            r = [p for p in parts if re.match(r'^run_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
-            if s and r:
-                s_val = int(re.search(r'\d+', s[-1]).group())
-                if set_range[0] <= s_val <= set_range[1]:
-                    scan_queue.append((os.path.join(root, target_file), s[-1], r[-1], metric, stride))
+    
+    # SYSTEM OPTIMIZATION: Predict direct structure based on the --input (root_dir) parameter layout
+    search_pattern = os.path.join(root_dir, "set_*", "run_*", target_file).replace("\\", "/")
+    print(f"[INFO] Scanning filesystem via targeted pattern layout: {search_pattern}")
+    
+    for file_path in glob.iglob(search_pattern):
+        clean_path = file_path.replace("\\", "/")
+        parts = clean_path.split("/")
+        
+        # Parse structural context attributes directly out of file tokens
+        s_folders = [p for p in parts if re.match(r'^set_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
+        r_folders = [p for p in parts if re.match(r'^run_[a-zA-Z0-9]+$', p, re.IGNORECASE)]
+        
+        if s_folders and r_folders:
+            s_val = int(re.search(r'\d+', s_folders[-1]).group())
+            r_val = int(re.search(r'\d+', r_folders[-1]).group())
+            
+            # Filter rows based on command-line scenario scale bounds
+            if (set_range[0] <= s_val <= set_range[1]) and (run_range[0] <= r_val <= run_range[1]):
+                scan_queue.append((file_path, s_folders[-1], r_folders[-1], metric, stride))
+                
+    total_files = len(scan_queue)
+    print(f"[INFO] Ingestion queue populated with {total_files} file targets.")
+    if total_files == 0:
+        print("[-] Error: No matching simulation source files located. Check your path variables.")
+        sys.exit(1)
     
     # SCHEMA OPTIMIZATION: int16 tracking keys and float32 data representations
     schema = pa.schema([('set_num', pa.int16()), (metric, pa.float32())])
@@ -133,11 +157,11 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
         writer = pa.ipc.RecordBatchFileWriter(sink, schema)
         
     batches, accumulated_rows = [], 0
+    chunk_write_boundary = 5000000  # OPTIMIZATION: Higher chunk ceiling saves output write coordination overhead
 
     with multiprocessing.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=500) as pool:
         for item in pool.imap_unordered(read_single_parquet_raw_stream, scan_queue, chunksize=50):
             if item is not None and len(item['y']) > 0:
-                # Extract clean integer values from the text source labels
                 match = re.search(r'\d+', str(item['set_id']))
                 clean_set_num = int(match.group()) if match else 0
                 
@@ -148,23 +172,25 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
                 batches.append(batch)
                 accumulated_rows += len(item['y'])
                 
-                # DUAL-FORMAT STREAMING: Safely write chunks dynamically to avoid RAM bloating
-                if accumulated_rows >= 500000:
-                    table_chunk = pa.Table.from_batches(batches)
+                # DUAL-FORMAT STREAMING: Stream chunks properly aligned with file layout expectations
+                if accumulated_rows >= chunk_write_boundary:
                     if format_type == 'parquet':
+                        table_chunk = pa.Table.from_batches(batches)
                         writer.write_table(table_chunk)
                     else:
-                        for b in batches: writer.write_batch(b)
+                        for b in batches: 
+                            writer.write_batch(b)
                     batches, accumulated_rows = [], 0
                     gc.collect()
 
     # Flush final leftovers
     if batches:
-        table_chunk = pa.Table.from_batches(batches)
         if format_type == 'parquet':
+            table_chunk = pa.Table.from_batches(batches)
             writer.write_table(table_chunk)
         else:
-            for b in batches: writer.write_batch(b)
+            for b in batches: 
+                writer.write_batch(b)
 
     writer.close()
     if format_type != 'parquet':
@@ -180,7 +206,16 @@ def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir,
         with pa.memory_map(checkpoint_path, 'rb') as source:
             table = pa.ipc.RecordBatchFileReader(source).read_all()
             
+    # CRITICAL SAFEGUARD: Verify that checkpoint schema matches current engine requirements
+    if 'set_num' not in table.column_names:
+        raise ValueError(
+            f"Schema mismatch in checkpoint file '{checkpoint_path}'.\n"
+            f"Available columns: {table.column_names}.\n"
+            f"Fix: Delete this stale checkpoint file and re-run to reconstruct it with the correct fields."
+        )
+            
     import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
     
     # Load parameters lookup reference file into a small reference DataFrame
     param_meta_df = pd.read_csv(parameters_file_path)
@@ -208,20 +243,70 @@ def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir,
     economic_parameters = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_id', metric}]
     
     for param_name in economic_parameters:
-        # BYPASS PANDAS MERGE: Use index offsets for ultra-fast, zero-allocation matching
-        # Subtracting 1 aligns the 1-indexed set numbers directly to 0-indexed numpy positions
-        mapped_param = param_meta_df[param_name].values[set_num_array - 1]
+        # OPTIMIZATION A: Force float32 mapping to prevent 64-bit vector memory inflation
+        mapped_param = param_meta_df[param_name].values.astype(np.float32)[set_num_array - 1]
         
-        for current_style in (['color', 'greyscale'] if style == 'color-and-greyscale' else [style]):
+        # Determine active visualization style modes
+        if style == 'color-and-greyscale':
+            render_styles = ['color', 'greyscale']
+        else:
+            render_styles = [style]
+            
+        for current_style in render_styles:
             fig, ax = plt.subplots(figsize=(11, 6))
-            ax.scatter(mapped_param, metric_array, alpha=0.04, s=0.4, c='#1f77b4' if current_style == 'color' else '#404040', edgecolors='none')
-            ax.set_title(f"GSA Bifurcation Mapping - {param_name.upper()} ({current_style.capitalize()})", fontsize=12, fontweight='bold')
-            ax.set_xlabel(f"Economic Input: {param_name}"); ax.set_ylabel(f"Dynamic Space: {metric}"); ax.grid(True, linestyle='--', alpha=0.3)
+            
+            # OPTIMIZATION C: 2D Density Binned Plotting Layout
+            if current_style == 'color':
+                # BINS: 500x500 Mesh Grid Resolution
+                # CMAP: 'turbo' Google Perceptually Uniform Rainbow Heatmap (Purple -> Blue -> Green -> Yellow -> Red)
+                # NORM: LogNorm ensures low-density chaotic tracking paths aren't hidden by dense core attractors
+                counts, xedges, yedges, im = ax.hist2d(
+                    mapped_param, metric_array, 
+                    bins=500, 
+                    cmap='turbo', 
+                    norm=mcolors.LogNorm(),
+                    cmin=1
+                )
+                cbar = fig.colorbar(im, ax=ax, pad=0.02)
+                cbar.set_label('Stochastic Point Density (Log Scale)', fontsize=10)
+                ax.set_title(f"GSA Heatmap - {param_name.upper()} (Turbo Rainbow)", fontsize=12, fontweight='bold')
+                
+            elif current_style == 'greyscale':
+                counts, xedges, yedges, im = ax.hist2d(
+                    mapped_param, metric_array, 
+                    bins=500, 
+                    cmap='gray_r', 
+                    norm=mcolors.LogNorm(),
+                    cmin=1
+                )
+                cbar = fig.colorbar(im, ax=ax, pad=0.02)
+                cbar.set_label('Stochastic Point Density (Log Scale)', fontsize=10)
+                ax.set_title(f"GSA Heatmap - {param_name.upper()} (Greyscale)", fontsize=12, fontweight='bold')
+                
+            elif current_style == 'scatter':
+                # OPTIMIZATION B: High-Fidelity Downsampling Guardrail (Caps scatter tracking to exactly 5 Million Points max)
+                MAX_PLOT_POINTS = 5_000_000
+                if len(metric_array) > MAX_PLOT_POINTS:
+                    rng = np.random.default_rng(seed=42)
+                    sample_indices = rng.choice(len(metric_array), size=MAX_PLOT_POINTS, replace=False)
+                    scat_x = mapped_param[sample_indices]
+                    scat_y = metric_array[sample_indices]
+                else:
+                    scat_x = mapped_param
+                    scat_y = metric_array
+                    
+                ax.scatter(scat_x, scat_y, alpha=0.04, s=0.4, c='#1f77b4', edgecolors='none')
+                ax.set_title(f"GSA Scatter Bifurcation - {param_name.upper()} (Downsampled to 5M Points Max)", fontsize=12, fontweight='bold')
+
+            ax.set_xlabel(f"Economic Input: {param_name}")
+            ax.set_ylabel(f"Dynamic Space: {metric}")
+            ax.grid(True, linestyle='--', alpha=0.2)
+            
             plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}_{current_style}.png"), dpi=150, bbox_inches='tight')
             plt.clf(); plt.close('all'); gc.collect()
 
 # ==========================================
-# RUNTIME
+# RUNTIME ENTRY POINT
 # ==========================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -234,6 +319,11 @@ if __name__ == '__main__':
     parser.add_argument('--percentile', type=float, default=100)
     args = parser.parse_args()
     
+    # Block internal computational library execution hooks to prevent 2-core CPU context-switch choking
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    
     profiler = LiveMemoryProfiler(); profiler.start()
     try:
         for current_metric in [m.strip() for m in args.metric.split(',')]:
@@ -241,6 +331,7 @@ if __name__ == '__main__':
             os.makedirs(out_dir, exist_ok=True)
             chk_path = os.path.join(out_dir, f"checkpoint_{current_metric}.{args.format}")
             
+            # Compile metric streams if no valid checkpoint file is found on disk
             if not (args.checkpoint and os.path.exists(chk_path)):
                 stream_metric_data_to_file(
                     args.input, args.table, current_metric, 
@@ -249,6 +340,7 @@ if __name__ == '__main__':
                     args.workers, args.stride, chk_path, args.format
                 )
             
+            # Execute zero-copy plotting engine using optimized routines
             generate_bifurcation_plots(chk_path, current_metric, args.format, out_dir, args.style, args.parameters, args.percentile)
     finally:
         profiler.stop(); profiler.join()
