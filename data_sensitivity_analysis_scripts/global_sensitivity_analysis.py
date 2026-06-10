@@ -37,6 +37,12 @@ DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
        batch-by-batch. This architecture decouples memory usage from dataset size, 
        ensuring that RAM usage remains flat regardless of whether the dataset 
        is 1 GB or 100 GB.
+
+    10. [Deterministic Garbage Collection]: Implements explicit memory sweeping 
+        using `gc.collect()` at the boundary of each iteration chunk. This forces 
+        the immediate reclamation of stale batch dataframe references, eliminating 
+        high-throughput memory accumulation and mitigating transient 18 GB 
+        system RAM and swap saturation spikes.
 """
 
 import os, re, gc, sys, time, argparse, glob, threading, multiprocessing
@@ -47,7 +53,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.ipc as ipc
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+import matplotlib.colors mcolors
 
 class LiveMemoryProfiler(threading.Thread):
     def __init__(self, log_path="gsa_memory_profile.csv", interval_sec=2.0):
@@ -83,7 +89,10 @@ def read_single_parquet_raw_stream(args):
             y_raw = raw_batch.column(metric).to_numpy().astype(np.float32)
             if stride > 1: y_raw = y_raw[::stride]
             if len(y_raw) > 0: processed_chunks.append(y_raw)
-        return {'set_id': set_id, 'y': np.concatenate(processed_chunks)} if processed_chunks else None
+        
+        result_array = np.concatenate(processed_chunks) if processed_chunks else None
+        del processed_chunks
+        return {'set_id': set_id, 'y': result_array} if result_array is not None else None
     except: return None
 
 def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type, verbose):
@@ -112,7 +121,12 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
                 processed_count += 1
                 if verbose and processed_count % 100 == 0:
                     print(f"  -> Processed {processed_count}/{len(scan_queue)} files...")
+                del item; del batch
+                # Periodic garbage collection inside high-throughput IPC receiver loop
+                if processed_count % 500 == 0:
+                    gc.collect()
     writer.close()
+    gc.collect()
     log(f"[FINISH] Checkpoint created: {output_checkpoint_path}", verbose)
 
 def get_iterator(checkpoint_path, format_type, columns):
@@ -155,12 +169,16 @@ def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir,
             if np.any(mask):
                 H, _, _ = np.histogram2d(param_vector[sets[mask]-1], vals[mask], bins=[x_edges, y_edges])
                 hist_grid += H
+            del sets; del vals; del mask
         
         fig, ax = plt.subplots(figsize=(11, 6))
         im = ax.imshow(hist_grid.T, origin='lower', extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]], 
                        cmap='turbo', norm=mcolors.LogNorm(vmin=1, vmax=hist_grid.max() or 1), aspect='auto')
         plt.colorbar(im, ax=ax); plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}.png")); plt.close('all')
-        if source: source.close(); gc.collect()
+        
+        del param_vector; del hist_grid; del fig; del ax
+        if source: source.close()
+        gc.collect() # Force immediate reclamation of plot memory structures
     log(f"[FINISH] Plotting completed for {metric}", verbose)
 
 if __name__ == '__main__':
