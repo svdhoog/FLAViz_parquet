@@ -66,6 +66,10 @@ class LiveMemoryProfiler(threading.Thread):
             time.sleep(self.interval_sec)
     def stop(self): self.is_running = False
 
+def log(message, verbose=False):
+    if verbose:
+        print(f"[{time.strftime('%H:%M:%S')}] {message}")
+
 def init_worker():
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -82,7 +86,8 @@ def read_single_parquet_raw_stream(args):
         return {'set_id': set_id, 'y': np.concatenate(processed_chunks)} if processed_chunks else None
     except: return None
 
-def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type):
+def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type, verbose):
+    log(f"[START] Scanning hierarchy for {metric}...", verbose)
     target_file = f"data_{table_name}.parquet"
     scan_queue = []
     for file_path in glob.iglob(os.path.join(root_dir, "set_*", "run_*", target_file).replace("\\", "/")):
@@ -92,9 +97,11 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
         if (set_range[0] <= s_val <= set_range[1]) and (run_range[0] <= r_val <= run_range[1]):
             scan_queue.append((file_path, parts[-3], parts[-2], metric, stride))
     
+    log(f"[INGEST] Identified {len(scan_queue)} files for processing.", verbose)
     schema = pa.schema([('set_num', pa.int16()), (metric, pa.float32())])
     writer = pq.ParquetWriter(output_checkpoint_path, schema) if format_type == 'parquet' else ipc.RecordBatchFileWriter(open(output_checkpoint_path, 'wb'), schema)
     
+    processed_count = 0
     with multiprocessing.Pool(processes=num_workers, initializer=init_worker) as pool:
         for item in pool.imap_unordered(read_single_parquet_raw_stream, scan_queue):
             if item:
@@ -102,7 +109,11 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
                 batch = pa.RecordBatch.from_arrays([np.repeat(set_num, len(item['y'])).astype(np.int16), item['y']], schema=schema)
                 if format_type == 'parquet': writer.write_table(pa.Table.from_batches([batch]))
                 else: writer.write_batch(batch)
+                processed_count += 1
+                if verbose and processed_count % 100 == 0:
+                    print(f"  -> Processed {processed_count}/{len(scan_queue)} files...")
     writer.close()
+    log(f"[FINISH] Checkpoint created: {output_checkpoint_path}", verbose)
 
 def get_iterator(checkpoint_path, format_type, columns):
     if format_type == 'parquet':
@@ -112,12 +123,13 @@ def get_iterator(checkpoint_path, format_type, columns):
         reader = ipc.RecordBatchFileReader(source)
         return (reader.get_batch(i) for i in range(reader.num_record_batches)), source
 
-def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir, style, parameters_file_path, percentile_limit):
+def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir, style, parameters_file_path, percentile_limit, verbose):
+    log(f"[START] Plotting bifurcation for {metric}...", verbose)
     param_meta_df = pd.read_csv(parameters_file_path)
     param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
     param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
     
-    # Pass 1: Percentile threshold via streaming sample (1M points max)
+    log(f"[ANALYSIS] Calculating global threshold...", verbose)
     sample_points = []
     it, _ = get_iterator(checkpoint_path, format_type, [metric])
     for batch in it:
@@ -125,11 +137,12 @@ def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir,
         if sum(len(s) for s in sample_points) > 1_000_000: break
     threshold = np.percentile(np.concatenate(sample_points), percentile_limit)
     del sample_points; gc.collect()
+    log(f"  -> Threshold set at {threshold:.4f} (percentile {percentile_limit})", verbose)
 
     economic_params = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_id', metric}]
     for param_name in economic_params:
+        log(f"[RENDER] Creating plot for {param_name.upper()}...", verbose)
         param_vector = param_meta_df[param_name].values.astype(np.float32)
-        # Initialize streaming histogram grid (500x500)
         hist_grid = np.zeros((500, 500))
         x_edges = np.linspace(param_vector.min(), param_vector.max(), 501)
         y_edges = np.linspace(0, threshold, 501)
@@ -148,6 +161,7 @@ def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir,
                        cmap='turbo', norm=mcolors.LogNorm(vmin=1, vmax=hist_grid.max() or 1), aspect='auto')
         plt.colorbar(im, ax=ax); plt.savefig(os.path.join(output_dir, f"bifurcation_{metric}_{param_name}.png")); plt.close('all')
         if source: source.close(); gc.collect()
+    log(f"[FINISH] Plotting completed for {metric}", verbose)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -157,7 +171,8 @@ if __name__ == '__main__':
     parser.add_argument('--sets', required=True); parser.add_argument('--runs', required=True)
     parser.add_argument('--workers', type=int, default=1); parser.add_argument('--stride', type=int, default=1)
     parser.add_argument('--checkpoint', action='store_true'); parser.add_argument('--format', default='parquet')
-    parser.add_argument('--percentile', type=float, default=100)
+    parser.add_argument('--percentile', type=float, default=100); parser.add_argument('--no-plot', action='store_true')
+    parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
     
     os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"})
@@ -168,6 +183,7 @@ if __name__ == '__main__':
             os.makedirs(out_dir, exist_ok=True)
             chk_path = os.path.join(out_dir, f"checkpoint_{current_metric}.{args.format}")
             if not (args.checkpoint and os.path.exists(chk_path)):
-                stream_metric_data_to_file(args.input, args.table, current_metric, [int(x) for x in args.sets.split('-')], [int(x) for x in args.runs.split('-')], args.workers, args.stride, chk_path, args.format)
-            generate_bifurcation_plots(chk_path, current_metric, args.format, out_dir, args.style, args.parameters, args.percentile)
+                stream_metric_data_to_file(args.input, args.table, current_metric, [int(x) for x in args.sets.split('-')], [int(x) for x in args.runs.split('-')], args.workers, args.stride, chk_path, args.format, args.verbose)
+            if not args.no_plot:
+                generate_bifurcation_plots(chk_path, current_metric, args.format, out_dir, args.style, args.parameters, args.percentile, args.verbose)
     finally: profiler.stop(); profiler.join()

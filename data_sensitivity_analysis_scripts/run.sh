@@ -8,9 +8,9 @@ OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sand
 SAMPLE_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_models/ABM/calibration_data'
 SAMPLE_FILE='sample_513_mode_3_with_headers.csv'
 
-#METRICS="unemployment_rate, monthly_output, price_index, total_debt"
-METRICS="unemployment_rate"
-#METRICS="monthly_output, price_index, total_debt"
+#METRICS=("unemployment_rate" "monthly_output" "price_index" "total_debt")
+#METRICS=("monthly_output" "price_index" "total_debt")
+METRICS=("unemployment_rate")
 
 # Usage:
 # python global_sensitivity_analysis.py \
@@ -19,28 +19,40 @@ METRICS="unemployment_rate"
 #	--table Agent_n \
 #	--metric var_names \
 #   --output "$OUTPUT_DIR/$OUTPUT_FILE" \
+#   --no-plot \
 #	--style [color|greyscale|color-and-greyscale] \
-#   --percentile 95
-#	--sets 1-10 \
-#	--runs 1-100 \
-#	--workers 4 \
-#   --stride 5 \
+#   --percentile 99 \
+#   --sets 1-513 \
+#   --runs 1-1000 \
+#	--workers 2 \
+#   --stride [1|2|5|10] \
 #   --checkpoint \
-#   --format ['feather'|'parquet']
+#   --format ['feather'|'parquet'] \
+#   --verbose
+#   >"logs/stdout.log" \
+#  2>"logs/stderr.log"
 
 # GSA for all metrics in $METRICS
 # Optimized for Memory Stability
-time python global_sensitivity_analysis.py \
-    --input "$INPUT_DIR" \
-    --parameters "$SAMPLE_DIR/$SAMPLE_FILE" \
-    --table Eurostat \
-    --metric "$METRICS" \
-    --output "$OUTPUT_DIR" \
-    --style color \
-    --percentile 99 \
-    --sets 1-513 \
-    --runs 1-1000 \
-    --workers 2 \
-    --stride 1 \
-    --checkpoint \
-    --format 'feather'
+# Execute metrics one by one to keep memory deterministic
+echo "[BASH] Start processing metrics: ${METRICS[@]}"
+for m in "${METRICS[@]}"; do
+    echo "[BASH] Start process for metric: $m"
+    #python global_sensitivity_analysis.py \
+    time python global_sensitivity_analysis.py \
+        --input "$INPUT_DIR" \
+        --parameters "$SAMPLE_DIR/$SAMPLE_FILE" \
+        --table Eurostat \
+        --metric "$m" \
+        --output "$OUTPUT_DIR" \
+        --style color-and-greyscale \
+        --percentile 99 \
+        --sets 1-513 \
+        --runs 1-1000 \
+        --workers 2 \
+        --stride 10 \
+        --checkpoint \
+        --format 'feather' \
+        --verbose \
+        >"logs/${m}_stdout.log" 2>"logs/${m}_stderr.log"
+done
