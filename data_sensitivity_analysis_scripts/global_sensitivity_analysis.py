@@ -43,6 +43,10 @@ DESIGN DECISIONS & ARCHITECTURAL EVOLUTION:
         the immediate reclamation of stale batch dataframe references, eliminating 
         high-throughput memory accumulation and mitigating transient 18 GB 
         system RAM and swap saturation spikes.
+
+    11. [Temporal Metadata Indexing]: Extends schemas to include `run_num` and 
+        `time_step` (as int16), enabling time-series reconstruction while 
+        maintaining memory-efficient 16-bit type constraints.
 """
 
 import os, re, gc, sys, time, argparse, glob, threading, multiprocessing
@@ -53,7 +57,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.ipc as ipc
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-import matplotlib.colors mcolors
+import matplotlib.colors as mcolors
 
 class LiveMemoryProfiler(threading.Thread):
     def __init__(self, log_path="gsa_memory_profile.csv", interval_sec=2.0):
@@ -85,14 +89,15 @@ def read_single_parquet_raw_stream(args):
     try:
         processed_chunks = []
         pf = pq.ParquetFile(file_path)
-        for raw_batch in pf.iter_batches(batch_size=100_000, columns=[metric]):
+        # Apply Remedy C (Batch size adjustment)
+        for raw_batch in pf.iter_batches(batch_size=50_000, columns=[metric]):
             y_raw = raw_batch.column(metric).to_numpy().astype(np.float32)
             if stride > 1: y_raw = y_raw[::stride]
             if len(y_raw) > 0: processed_chunks.append(y_raw)
         
         result_array = np.concatenate(processed_chunks) if processed_chunks else None
         del processed_chunks
-        return {'set_id': set_id, 'y': result_array} if result_array is not None else None
+        return {'set_id': set_id, 'run_id': run_id, 'y': result_array} if result_array is not None else None
     except: return None
 
 def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_range, num_workers, stride, output_checkpoint_path, format_type, verbose):
@@ -107,7 +112,13 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
             scan_queue.append((file_path, parts[-3], parts[-2], metric, stride))
     
     log(f"[INGEST] Identified {len(scan_queue)} files for processing.", verbose)
-    schema = pa.schema([('set_num', pa.int16()), (metric, pa.float32())])
+    # Updated Schema with temporal indexing
+    schema = pa.schema([
+        ('set_num', pa.int16()), 
+        ('run_num', pa.int16()), 
+        ('time_step', pa.int16()), 
+        (metric, pa.float32())
+    ])
     writer = pq.ParquetWriter(output_checkpoint_path, schema) if format_type == 'parquet' else ipc.RecordBatchFileWriter(open(output_checkpoint_path, 'wb'), schema)
     
     processed_count = 0
@@ -115,23 +126,33 @@ def stream_metric_data_to_file(root_dir, table_name, metric, set_range, run_rang
         for item in pool.imap_unordered(read_single_parquet_raw_stream, scan_queue):
             if item:
                 set_num = int(re.search(r'\d+', item['set_id']).group())
-                batch = pa.RecordBatch.from_arrays([np.repeat(set_num, len(item['y'])).astype(np.int16), item['y']], schema=schema)
+                run_num = int(re.search(r'\d+', item['run_id']).group())
+                n = len(item['y'])
+                
+                # Create synchronous time_step vector
+                t_steps = np.arange(1, n + 1, dtype=np.int16)
+                
+                batch = pa.RecordBatch.from_arrays([
+                    np.repeat(set_num, n).astype(np.int16),
+                    np.repeat(run_num, n).astype(np.int16),
+                    t_steps,
+                    item['y']
+                ], schema=schema)
+                
                 if format_type == 'parquet': writer.write_table(pa.Table.from_batches([batch]))
                 else: writer.write_batch(batch)
                 processed_count += 1
-                if verbose and processed_count % 100 == 0:
-                    print(f"  -> Processed {processed_count}/{len(scan_queue)} files...")
-                del item; del batch
-                # Periodic garbage collection inside high-throughput IPC receiver loop
-                if processed_count % 500 == 0:
-                    gc.collect()
+                
+                del item; del batch; del t_steps
+                if processed_count % 500 == 0: gc.collect()
     writer.close()
     gc.collect()
     log(f"[FINISH] Checkpoint created: {output_checkpoint_path}", verbose)
 
 def get_iterator(checkpoint_path, format_type, columns):
+    # Apply Remedy C: Reduced batch size for rendering pass
     if format_type == 'parquet':
-        return pq.ParquetFile(checkpoint_path).iter_batches(batch_size=250_000, columns=columns), None
+        return pq.ParquetFile(checkpoint_path).iter_batches(batch_size=50_000, columns=columns), None
     else:
         source = pa.memory_map(checkpoint_path, 'rb')
         reader = ipc.RecordBatchFileReader(source)
@@ -178,7 +199,7 @@ def generate_bifurcation_plots(checkpoint_path, metric, format_type, output_dir,
         
         del param_vector; del hist_grid; del fig; del ax
         if source: source.close()
-        gc.collect() # Force immediate reclamation of plot memory structures
+        gc.collect() 
     log(f"[FINISH] Plotting completed for {metric}", verbose)
 
 if __name__ == '__main__':
