@@ -8,9 +8,9 @@ OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sand
 SAMPLE_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_models/ABM/calibration_data'
 SAMPLE_FILE='sample_513_mode_3_with_headers.csv'
 
-#METRICS=("unemployment_rate" "monthly_output" "price_index" "total_debt")
+METRICS=("unemployment_rate" "monthly_output" "price_index" "total_debt")
 #METRICS=("monthly_output" "price_index" "total_debt")
-METRICS=("unemployment_rate")
+#METRICS=("unemployment_rate")
 
 # Usage:
 # python global_sensitivity_analysis.py \
@@ -45,6 +45,7 @@ for m in "${METRICS[@]}"; do
         --table Eurostat \
         --metric "$m" \
         --output "$OUTPUT_DIR" \
+        --no-plot \
         --style color-and-greyscale \
         --percentile 99 \
         --sets 1-513 \

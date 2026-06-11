@@ -1,0 +1,5 @@
+Case,Checkpoint Format,Checkpoint File Size,Streaming Duration,Peak RAM (Unoptimized),Peak RAM (Optimized),Mean RAM (Unoptimized)
+Case S,Feather,162.4 MB,~8 min,~7.2 GB,0.25 GB - 0.35 GB,~1.6 GB
+Case M,Feather,812.0 MB,~40 min,~18.0 GB,0.25 GB - 0.35 GB,~4.0 GB
+Case L,Feather,406.0 MB,~118 min,18.000 GB,0.25 GB - 0.35 GB,3.983 GB
+Case XL,Feather,3.96 GB,~400 min,OOM Killed,0.25 GB - 0.35 GB,OOM Killed

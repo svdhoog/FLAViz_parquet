@@ -1,0 +1,5 @@
+Case,Target Grid Space,Tracked Parameters,Plotting Duration,Combined Total Time,Peak RAM (Unoptimized),Peak RAM (Optimized)
+Case S,500 x 500,5,~6 min,~14 min,~7.2 GB,0.35 GB - 0.55 GB
+Case M,500 x 500,5,~30 min,~70 min,~18.0 GB,0.35 GB - 0.55 GB
+Case L,500 x 500,5,~82 min,200.0 min,18.000 GB,0.35 GB - 0.55 GB
+Case XL,500 x 500,5,~300 min,~700 min,OOM Killed,0.35 GB - 0.55 GB

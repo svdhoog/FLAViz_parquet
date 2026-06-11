@@ -36,7 +36,8 @@
 #python sql_to_parquet.py --input $INPUT_DIR --output $OUTPUT_DIR --sets 1-513 --runs 1-1000 #--force
 
 # Conversion from feather 2 parquet
-INPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_models/ABM/calibration_data/output'
+#INPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_models/ABM/calibration_data/output'
+INPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sandbox_parquet_integration/test_models/ABM/calibration_data/output/unemployment_rate'
 PYTHON_SCRIPT="feather_to_parquet.py"
 
 echo "Data conversion from : $INPUT_DIR"

@@ -1,0 +1,5 @@
+Case,Sets (N_sets),Runs per Set (N_runs),Stride Factor,Total Rows Extracted,Raw Input Data Format
+Case S,513,200,5,20520000,Uncompressed float64
+Case M,513,200,1,102600000,Uncompressed float64
+Case L,513,1000,10,51300000,Uncompressed float64
+Case XL,513,1000,1,513000000,Uncompressed float64
