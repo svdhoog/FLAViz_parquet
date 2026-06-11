@@ -20,9 +20,9 @@ root_dir/
 ```
 ### Key Analytical Insights from Inspection:
 
-    Uniform Time Steps: Each data_Eurostat.parquet file captures exactly 1,000 discrete ticks (mapped from simulation timeline iterations 6020 to 26000).
+* Uniform Time Steps: Each data_Eurostat.parquet file captures exactly 1,000 discrete ticks (mapped from simulation timeline iterations 6020 to 26000).
 
-    Variable Run Densities: The stochastic engine generates an asymmetrical number of Monte Carlo seeds per parameter configuration (e.g., set_1 completes 1001 runs, set_10 completes 969 runs, and set_103 completes 983 runs).
+* Variable Run Densities: The stochastic engine generates an asymmetrical number of Monte Carlo seeds per parameter configuration (e.g., set_1 completes 1001 runs, set_10 completes 969 runs, and set_103 completes 983 runs).
 
 ## 3. Core Reasons for Rejecting a Single Monolithic File Format
 
@@ -42,21 +42,22 @@ Under high workloads, the data streams push systems directly against physical me
 
 ### D. Write Independence and Fault Tolerance
 
-    No File Contention: During execution, independent worker nodes write their small data_Eurostat.parquet files simultaneously without competing for file locks or requiring a central coordinating system.
+* No File Contention: During execution, independent worker nodes write their small data_Eurostat.parquet files simultaneously without competing for file locks or requiring a central coordinating system.
 
-    Granular Fault Tolerance: If a worker node suffers a hardware fault at step 900, only that isolated set_n/run_m directory is corrupted. In contrast, an ungraceful termination or fault during parallel writes to a single monolithic file risks corrupting the entire database.
+* Granular Fault Tolerance: If a worker node suffers a hardware fault at step 900, only that isolated set_n/run_m directory is corrupted. In contrast, an ungraceful termination or fault during parallel writes to a single monolithic file risks corrupting the entire database.
 
 ## 4. The Two-Pass Reorganization Mechanism
 
 To resolve these limitations, the Global Sensitivity Analysis script converts the low-granularity distributed files into an optimized high-granularity format tailored for downstream calculations:
-
+```text
 [Simulation Stage]                  [ETL Ingestion Pass]                 [Target Analytical Layout]
 Low-Granularity Files       ───►    Streaming Multi-Process      ───►    High-Granularity Checkpoints
 (All economic variables             Ingestion (Downcasts data,           (Isolates data into flat, single-
 grouped per single run folder)      tracks run/time metadata)            variable streams across ALL sets)
+```
 
 ### Structural Transformation:
 
-    * Pass 1 (Ingestion & Re-indexing): The script streams rows from the scattered folders, downcasts floating-point columns to single-precision (float32), and appends memory-efficient 16-bit integers (int16) to explicitly track set_num, run_num, and time_step.
+* Pass 1 (Ingestion & Re-indexing): The script streams rows from the scattered folders, downcasts floating-point columns to single-precision (float32), and appends memory-efficient 16-bit integers (int16) to explicitly track set_num, run_num, and time_step.
 
-    * Pass 2 (Zero-Copy Plotting): The reorganized checkpoint files allow the script to slice data for an isolated metric instantaneously using fast memory maps, bypassing heavy Pandas dataframes and streaming rows in controlled, predictable blocks (e.g., 50,000 records per iteration) to guarantee a flat RAM profile.
+* Pass 2 (Zero-Copy Plotting): The reorganized checkpoint files allow the script to slice data for an isolated metric instantaneously using fast memory maps, bypassing heavy Pandas dataframes and streaming rows in controlled, predictable blocks (e.g., 50,000 records per iteration) to guarantee a flat RAM profile.
