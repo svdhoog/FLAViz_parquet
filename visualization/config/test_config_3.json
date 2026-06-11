@@ -2,7 +2,7 @@
     "comparison_sets": [
         "set_2"
     ],
-    "time_variable": "_ITERATION_NO",
+    "time_variable": "time_step",
     "plots": [
         {
             "plot_style": "scatter_plot",

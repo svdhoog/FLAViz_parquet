@@ -3,7 +3,7 @@
         "set_1",
         "set_2"
     ],
-    "time_variable": "_ITERATION_NO",
+    "time_variable": "time_step",
     "plots": [
         {
             "plot_style": "time_series",

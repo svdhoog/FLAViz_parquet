@@ -4,7 +4,11 @@
 FLAViz-Engine: Superimposed Multi-Iteration Plotting Suite (Strict & Inclusive)
 ================================================================================
 Description:
-    Implements native FLAViz core plotting routines over a Parquet dataset.
+    Implements native FLAViz core plotting routines over unified high-level
+    datasets. Dynamically resolves data files by running boundary-safe pattern
+    matching on variable names, allowing fluid support for 'checkpoint_$var',
+    'data_$var', or '$var' files in both .parquet and .feather formats.
+    
     Automatically superimposes multiple iteration values onto a single chart
     axis when a JSON range object is provided for 'target_iteration'.
 
@@ -14,72 +18,164 @@ Description:
     Treats the range 'stop' parameter as fully inclusive.
 
 Dependencies:
-    $ pip install duckdb pandas matplotlib numpy
+    $ pip install duckdb pandas matplotlib numpy pyarrow
 ================================================================================
 """
 
 import os
 import sys
 import json
+import re
 import argparse
 import duckdb
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-class ParquetFlavizEngine:
-    def __init__(self, parquet_root_dir):
+class UnifiedFlavizEngine:
+    def __init__(self, data_root_dir):
         """Initializes the engine using an active serverless DuckDB driver."""
-        self.root_dir = os.path.abspath(parquet_root_dir)
+        self.root_dir = os.path.abspath(data_root_dir)
         self.conn = duckdb.connect()
+        # Cache available files in the input folder to speed up regex evaluations
+        if os.path.isdir(self.root_dir):
+            self.available_files = os.listdir(self.root_dir)
+        else:
+            self.available_files = []
 
-    def _get_path(self, parameter_set, agent_type):
-        return os.path.join(self.root_dir, parameter_set, "*", f"data_{agent_type}.parquet")
+    def _resolve_metric_source(self, var_name):
+        """
+        Scans available directory contents using regex pattern matching to bind
+        variables to their respective files regardless of prefix (e.g. data_ or checkpoint_).
+        """
+        # Matches the variable name bounded by string limits, hyphens, or underscores
+        pattern = re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(var_name)}(?:^|[^a-zA-Z0-9])")
+        matched_files = []
+
+        for f in self.available_files:
+            name, ext = os.path.splitext(f)
+            if ext.lower() in ['.parquet', '.feather']:
+                if pattern.search(name):
+                    matched_files.append(f)
+
+        if not matched_files:
+            print(f"[FATAL ERROR] No matching Parquet or Feather data source found for metric: '{var_name}'")
+            print(f"              Directory scanned: {self.root_dir}")
+            sys.exit(1)
+        elif len(matched_files) > 1:
+            print(f"[FATAL ERROR] Ambiguous metric assignment. Multiple files match pattern for '{var_name}':")
+            for mf in matched_files:
+                print(f"              -> {mf}")
+            print("              Please ensure your metric files have distinct bounding names.")
+            sys.exit(1)
+
+        return os.path.join(self.root_dir, matched_files[0])
 
     # --------------------------------------------------------------------------
-    # DATA EXTRACTION AGGREGATORS
+    # DATA EXTRACTION AGGREGATORS (DUAL FORMAT & PATTERN MATCHING DRIVEN)
     # --------------------------------------------------------------------------
-    def query_time_series(self, p_set, agent, var, t_var):
+    def query_time_series(self, p_sets, agent, var, t_var):
+        p_sets_clause = ", ".join([f"'{p}'" for p in p_sets])
+        source_path = self._resolve_metric_source(var)
+        
         query = f"""
-            SELECT {t_var} as iteration, AVG({var}) as mean_val, MIN({var}) as min_val, MAX({var}) as max_val
-            FROM '{self._get_path(p_set, agent)}' GROUP BY {t_var} ORDER BY {t_var}
+            SELECT 
+                parameter_set,
+                {t_var} as iteration, 
+                AVG({var}) as mean_val, 
+                MIN({var}) as min_val, 
+                MAX({var}) as max_val
+            FROM '{source_path}'
+            WHERE parameter_set IN ({p_sets_clause})
+              AND agent_type = '{agent}'
+            GROUP BY parameter_set, {t_var} 
+            ORDER BY parameter_set, {t_var}
         """
         return self.conn.execute(query).df()
 
-    def query_snapshot_data(self, p_set, agent, var, t_var, iteration):
+    def query_snapshot_data(self, p_sets, agent, var, t_var, iterations):
+        p_sets_clause = ", ".join([f"'{p}'" for p in p_sets])
+        iter_clause = ", ".join([str(i) for i in iterations])
+        source_path = self._resolve_metric_source(var)
+        
         query = f"""
-            SELECT {var} as target_value FROM '{self._get_path(p_set, agent)}' WHERE {t_var} = {iteration}
+            SELECT 
+                parameter_set,
+                {t_var} as iteration,
+                {var} as target_value 
+            FROM '{source_path}' 
+            WHERE parameter_set IN ({p_sets_clause})
+              AND agent_type = '{agent}'
+              AND {t_var} IN ({iter_clause})
         """
         return self.conn.execute(query).df()
 
-    def query_scatter_data(self, p_set, agent, var_x, var_y, t_var, iteration):
+    def query_scatter_data(self, p_sets, agent, var_x, var_y, t_var, iterations):
+        p_sets_clause = ", ".join([f"'{p}'" for p in p_sets])
+        iter_clause = ", ".join([str(i) for i in iterations])
+        
+        source_x = self._resolve_metric_source(var_x)
+        source_y = self._resolve_metric_source(var_y)
+        
         query = f"""
-            SELECT {var_x} as x_val, {var_y} as y_val FROM '{self._get_path(p_set, agent)}' WHERE {t_var} = {iteration}
+            SELECT 
+                x.parameter_set,
+                x.{t_var} as iteration,
+                x.{var_x} as x_val, 
+                y.{var_y} as y_val 
+            FROM '{source_x}' x
+            INNER JOIN '{source_y}' y
+               ON x.parameter_set = y.parameter_set
+              AND x.run_id = y.run_id
+              AND x.{t_var} = y.{t_var}
+              AND x.agent_id = y.agent_id
+            WHERE x.parameter_set IN ({p_sets_clause})
+              AND x.agent_type = '{agent}'
+              AND x.{t_var} IN ({iter_clause})
         """
         return self.conn.execute(query).df()
 
-    def query_delay_data(self, p_set, agent, var, t_var, lag):
+    def query_delay_data(self, p_sets, agent, var, t_var, lag):
+        p_sets_clause = ", ".join([f"'{p}'" for p in p_sets])
+        source_path = self._resolve_metric_source(var)
+        
         query = f"""
             WITH aggregated AS (
-                SELECT {t_var} as iteration, AVG({var}) as avg_val 
-                FROM '{self._get_path(p_set, agent)}' GROUP BY {t_var}
+                SELECT 
+                    parameter_set,
+                    {t_var} as iteration, 
+                    AVG({var}) as avg_val 
+                FROM '{source_path}' 
+                WHERE parameter_set IN ({p_sets_clause})
+                  AND agent_type = '{agent}'
+                GROUP BY parameter_set, {t_var}
             )
-            SELECT avg_val as current_val, LAG(avg_val, {lag}) OVER (ORDER BY iteration) as lagged_val
+            SELECT 
+                parameter_set,
+                avg_val as current_val, 
+                LAG(avg_val, {lag}) OVER (PARTITION BY parameter_set ORDER BY iteration) as lagged_val
             FROM aggregated
         """
         df = self.conn.execute(query).df()
         return df.dropna()
 
     # --------------------------------------------------------------------------
-    # VISUALIZATION GRAPHICS ENGINES (SUPERIMPOSED)
+    # VISUALIZATION GRAPHICS ENGINES
     # --------------------------------------------------------------------------
     def plot_time_series(self, p_sets, agent, var, t_var):
         fig, ax = plt.subplots(figsize=(10, 6))
+        master_df = self.query_time_series(p_sets, agent, var, t_var)
+        
+        if master_df.empty:
+            plt.close(fig)
+            return None
+
         for p_set in p_sets:
-            df = self.query_time_series(p_set, agent, var, t_var)
+            df = master_df[master_df['parameter_set'] == p_set]
             if df.empty: continue
             line, = ax.plot(df['iteration'], df['mean_val'], label=f"Mean: {p_set}", lw=2)
             ax.fill_between(df['iteration'], df['min_val'], df['max_val'], alpha=0.15, color=line.get_color())
+            
         ax.set_title(f"Evolution of {var} ({agent} Agents)")
         ax.set_xlabel("Simulation Iteration")
         ax.set_ylabel(var)
@@ -90,14 +186,20 @@ class ParquetFlavizEngine:
 
     def plot_box_plot(self, p_sets, agent, var, t_var, iterations):
         fig, ax = plt.subplots(figsize=(10, 6))
+        master_df = self.query_snapshot_data(p_sets, agent, var, t_var, iterations)
+        
+        if master_df.empty:
+            plt.close(fig)
+            return None
+
         plot_data = []
         labels = []
         
         for iteration in iterations:
             for p_set in p_sets:
-                df = self.query_snapshot_data(p_set, agent, var, t_var, iteration)
-                if not df.empty:
-                    plot_data.append(df['target_value'].values)
+                subset = master_df[(master_df['parameter_set'] == p_set) & (master_df['iteration'] == iteration)]
+                if not subset.empty:
+                    plot_data.append(subset['target_value'].values)
                     labels.append(f"{p_set}\n(Iter {iteration})")
                     
         if not plot_data: 
@@ -113,19 +215,18 @@ class ParquetFlavizEngine:
 
     def plot_histogram(self, p_sets, agent, var, t_var, iterations):
         fig, ax = plt.subplots(figsize=(10, 6))
-        data_found = False
+        master_df = self.query_snapshot_data(p_sets, agent, var, t_var, iterations)
+        
+        if master_df.empty:
+            plt.close(fig)
+            return None
         
         for iteration in iterations:
             for p_set in p_sets:
-                df = self.query_snapshot_data(p_set, agent, var, t_var, iteration)
-                if not df.empty:
-                    data_found = True
-                    ax.hist(df['target_value'], bins=30, alpha=0.4, label=f"{p_set} (Iter {iteration})", edgecolor='black')
+                subset = master_df[(master_df['parameter_set'] == p_set) & (master_df['iteration'] == iteration)]
+                if not subset.empty:
+                    ax.hist(subset['target_value'], bins=30, alpha=0.4, label=f"{p_set} (Iter {iteration})", edgecolor='black')
                     
-        if not data_found:
-            plt.close(fig)
-            return None
-            
         ax.set_title(f"Superimposed Frequency Distribution of {var} ({agent} Agents)")
         ax.set_xlabel(var)
         ax.set_ylabel("Frequency Count")
@@ -136,19 +237,18 @@ class ParquetFlavizEngine:
 
     def plot_scatter(self, p_sets, agent, var, sec_var, t_var, iterations):
         fig, ax = plt.subplots(figsize=(10, 6))
-        data_found = False
+        master_df = self.query_scatter_data(p_sets, agent, var, sec_var, t_var, iterations)
+        
+        if master_df.empty:
+            plt.close(fig)
+            return None
         
         for iteration in iterations:
             for p_set in p_sets:
-                df = self.query_scatter_data(p_set, agent, var, sec_var, t_var, iteration)
-                if not df.empty:
-                    data_found = True
-                    ax.scatter(df['x_val'], df['y_val'], alpha=0.5, label=f"{p_set} (Iter {iteration})", s=20)
+                subset = master_df[(master_df['parameter_set'] == p_set) & (master_df['iteration'] == iteration)]
+                if not subset.empty:
+                    ax.scatter(subset['x_val'], subset['y_val'], alpha=0.5, label=f"{p_set} (Iter {iteration})", s=20)
                     
-        if not data_found:
-            plt.close(fig)
-            return None
-            
         ax.set_title(f"Superimposed Phase Scatter: {var} vs {sec_var}")
         ax.set_xlabel(var)
         ax.set_ylabel(sec_var)
@@ -159,14 +259,21 @@ class ParquetFlavizEngine:
 
     def plot_delay(self, p_sets, agent, var, t_var, lag):
         fig, ax = plt.subplots(figsize=(10, 6))
+        master_df = self.query_delay_data(p_sets, agent, var, t_var, lag)
+        
+        if master_df.empty:
+            plt.close(fig)
+            return None
+
         for p_set in p_sets:
-            df = self.query_delay_data(p_set, agent, var, t_var, lag)
+            df = master_df[master_df['parameter_set'] == p_set]
             if not df.empty:
                 ax.plot(df['lagged_val'], df['current_val'], alpha=0.7, label=f"{p_set} (Lag={lag})")
                 if len(df) > 1:
                     ax.annotate('', xy=(df['current_val'].iloc[-1], df['lagged_val'].iloc[-1]),
                                 xytext=(df['current_val'].iloc[-2], df['lagged_val'].iloc[-2]),
                                 arrowprops=dict(arrowstyle="->", color="red", lw=2))
+                                
         ax.set_title(f"Delay Phase Portrait: Mean {var} ($X_{{t}}$ vs $X_{{t-{lag}}}$)")
         ax.set_xlabel(f"Historical Value ($X_{{t-{lag}}}$)")
         ax.set_ylabel(f"Current Value ($X_{{t}}$)")
@@ -187,17 +294,11 @@ def load_config(config_path):
         sys.exit(1)
 
 def _resolve_iterations(target_val):
-    """
-    Parses the target_iteration property from the configuration file.
-    Enforces strict key presence and treats the 'stop' boundary as fully inclusive.
-    """
     if isinstance(target_val, dict):
         try:
             start = target_val["start"]
             stop = target_val["stop"]
             step = target_val["step"]
-            
-            # stop + step makes the range execution boundary mathematically inclusive
             return list(range(start, stop + step, step))
         except KeyError as e:
             print(f"[FATAL ERROR] Malformed config: The range object under 'target_iteration' is missing required key: {e}")
@@ -212,8 +313,8 @@ def _resolve_iterations(target_val):
 # Main Execution Entry Pipeline
 # ================================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FLAViz Parquet Batch Plot Processing Suite.")
-    parser.add_argument('-i', '--input', required=True, help="Path to Parquet output mirror.")
+    parser = argparse.ArgumentParser(description="FLAViz Multi-Format Unified Pattern-Matching Plot Suite.")
+    parser.add_argument('-i', '--input', required=True, help="Path to directory containing unified metric files.")
     parser.add_argument('-c', '--config', default="./config.json", help="Path to json configurations setup.")
     parser.add_argument('-o', '--output-dir', default=None, help="Output target directory folder.")
     args = parser.parse_args()
@@ -232,7 +333,7 @@ if __name__ == "__main__":
         print(f"[FATAL ERROR] Global configuration block is missing required parameter: {e}")
         sys.exit(1)
 
-    engine = ParquetFlavizEngine(args.input)
+    engine = UnifiedFlavizEngine(args.input)
     total_exported = 0
 
     for idx, p in enumerate(plots, start=1):
@@ -245,7 +346,6 @@ if __name__ == "__main__":
             print(f"[FATAL ERROR] Plot block index {idx} is missing a required parameter: {e}")
             sys.exit(1)
         
-        # Enforce that snapshot styles must declare a target_iteration
         if style in ["box_plot", "histogram", "scatter_plot"]:
             if "target_iteration" not in p:
                 print(f"[FATAL ERROR] Plot block index {idx} ('{style}') must declare a 'target_iteration'.")
@@ -254,12 +354,10 @@ if __name__ == "__main__":
         else:
             iterations = [0] 
 
-        # Enforce that scatter_plot must declare its secondary variable axis
         if style == "scatter_plot" and "secondary_variable" not in p:
             print(f"[FATAL ERROR] Plot block index {idx} ('scatter_plot') must declare a 'secondary_variable'.")
             sys.exit(1)
 
-        # Enforce that delay_plot must declare its delay lag value
         if style == "delay_plot" and "delay_lag" not in p:
             print(f"[FATAL ERROR] Plot block index {idx} ('delay_plot') must declare a 'delay_lag'.")
             sys.exit(1)
@@ -290,4 +388,3 @@ if __name__ == "__main__":
             print(f"  [Warning] No records matched data thresholds for plot block index {idx}.")
             
     print(f"\nBatch processing completed. Total figures strictly exported: {total_exported}")
-    
