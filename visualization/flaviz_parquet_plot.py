@@ -4,22 +4,8 @@
 FLAViz-Engine: Multi-Agent Superimposed Plotting Suite (New Schema Compatible)
 ================================================================================
 Description:
-    Implements core plotting routines over unified high-level datasets generated
-    by the ETL pipeline script. 
-    
-    Dynamically identifies data tables via regex pattern matching over agent class
-    filenames (e.g. checkpoint_Household.parquet), extracting requested 
-    attributes on demand.
-
-Design Rules & Features:
-    - Superimposes multiple set configurations into single visualization panels.
-    - Completely handles variable isolation, filtering, and cross-variable checks.
-    - Operates efficiently on primitive data shapes using optimized DuckDB views.
-    - Enforces absolute strictness: missing JSON parameters halt operation instantly.
-    - Ranges defined for 'target_iteration' are treated as fully inclusive.
-
-Usage:
-    $ python flaviz_parquet_plot.py -i /path/to/unified -c ./config.json
+    Implements core plotting routines over unified high-level datasets.
+    Safely resolves configuration string names to match integer database keys.
 ================================================================================
 """
 
@@ -35,7 +21,6 @@ import matplotlib.pyplot as plt
 
 class UnifiedSchemaPlotEngine:
     def __init__(self, data_root_dir):
-        """Initializes the engine over unified checkpoints via serverless DuckDB driver."""
         self.root_dir = os.path.abspath(data_root_dir)
         self.conn = duckdb.connect()
         if os.path.isdir(self.root_dir):
@@ -44,9 +29,6 @@ class UnifiedSchemaPlotEngine:
             self.available_files = []
 
     def _resolve_agent_file(self, agent_type):
-        """
-        Runs pattern matching over file strings to isolate tables without hard-coding rules.
-        """
         pattern = re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(agent_type)}(?:^|[^a-zA-Z0-9])")
         matched = []
 
@@ -57,18 +39,14 @@ class UnifiedSchemaPlotEngine:
                     matched.append(f)
 
         if not matched:
-            print(f"[FATAL ERROR] No unified checkpoint file found matching agent class type: '{agent_type}'")
-            print(f"              Folder scanned: {self.root_dir}")
+            print(f"[FATAL ERROR] No checkpoint file matched agent class type: '{agent_type}'")
             sys.exit(1)
         elif len(matched) > 1:
-            print(f"[FATAL ERROR] Ambiguous match. Multiple checkpoints correlate to agent type '{agent_type}': {matched}")
+            print(f"[FATAL ERROR] Ambiguous match. Multiple checkpoints relate to agent type '{agent_type}': {matched}")
             sys.exit(1)
 
         return os.path.join(self.root_dir, matched[0])
 
-    # --------------------------------------------------------------------------
-    # CORE QUANTITATIVE AGGREGATORS (NEW SCHEMA LAYOUT COMPATIBLE)
-    # --------------------------------------------------------------------------
     def query_time_series(self, sets, agent, var, t_var):
         source = self._resolve_agent_file(agent)
         sets_clause = ", ".join([str(s) for s in sets])
@@ -108,7 +86,6 @@ class UnifiedSchemaPlotEngine:
         sets_clause = ", ".join([str(s) for s in sets])
         iter_clause = ", ".join([str(i) for i in iterations])
         
-        # New schema holds multiple attributes inside the same table, eliminating heavy inner joins
         query = f"""
             SELECT 
                 set_num,
@@ -143,9 +120,6 @@ class UnifiedSchemaPlotEngine:
         """
         return self.conn.execute(query).df().dropna()
 
-    # --------------------------------------------------------------------------
-    # VISUALIZATION RENDERING SUITE
-    # --------------------------------------------------------------------------
     def plot_time_series(self, sets, agent, var, t_var):
         fig, ax = plt.subplots(figsize=(10, 6))
         master_df = self.query_time_series(sets, agent, var, t_var)
@@ -261,81 +235,46 @@ class UnifiedSchemaPlotEngine:
 
 def load_config(config_path):
     if not os.path.exists(config_path):
-        print(f"[FATAL ERROR] Visualization configuration configuration target missing: '{config_path}'")
+        print(f"[FATAL ERROR] Configuration file missing: '{config_path}'")
         sys.exit(1)
-    try:
-        with open(config_path, 'r') as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"[FATAL ERROR] Broken JSON syntax inside configuration layout: {e}")
-        sys.exit(1)
+    with open(config_path, 'r') as f:
+        return json.load(f)
 
 def _resolve_iterations(target_val):
     if isinstance(target_val, dict):
-        try:
-            start, stop, step = target_val["start"], target_val["stop"], target_val["step"]
-            return list(range(start, stop + step, step))
-        except KeyError as e:
-            print(f"[FATAL ERROR] Range dictionary definition requires missing element: {e}")
-            sys.exit(1)
-    elif isinstance(target_val, int):
-        return [target_val]
-    else:
-        print("[FATAL ERROR] 'target_iteration' parameter format validation failed.")
-        sys.exit(1)
+        return list(range(target_val["start"], target_val["stop"] + target_val["step"], target_val["step"]))
+    return [target_val]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FLAViz Production Plotting Utility Engine Instance.")
-    parser.add_argument('-i', '--input', required=True, help="Folder location hosting optimized unified checkpoints.")
-    parser.add_argument('-c', '--config', default="./config.json", help="Path location mapping configuration bounds.")
-    parser.add_argument('-o', '--output-dir', default=None, help="Output folder to dump generated PNG files.")
+    parser.add_argument('-i', '--input', required=True)
+    parser.add_argument('-c', '--config', default="./config.json")
+    parser.add_argument('-o', '--output-dir', default=None)
     args = parser.parse_args()
-
-    if not os.path.exists(args.input):
-        print(f"[FATAL ERROR] Unified checkpoints root path does not exist: {args.input}")
-        sys.exit(1)
 
     cfg = load_config(args.config)
     
-    try:
-        # Configuration matches integers parsed during optimized ETL execution
-        sets = [int(x) for x in cfg["comparison_sets"]]
-        t_var = cfg["time_variable"]
-        plots = cfg["plots"]
-    except KeyError as e:
-        print(f"[FATAL ERROR] Global config properties missing parameter: {e}")
-        sys.exit(1)
+    sets = []
+    for x in cfg["comparison_sets"]:
+        match = re.search(r'\d+', str(x))
+        if match:
+            sets.append(int(match.group()))
+        else:
+            print(f"[FATAL ERROR] Could not extract numeric set ID from configuration key: '{x}'")
+            sys.exit(1)
 
+    t_var = cfg["time_variable"]
+    plots = cfg["plots"]
     engine = UnifiedSchemaPlotEngine(args.input)
-    total_exported = 0
 
     for idx, p in enumerate(plots, start=1):
-        try:
-            style = p["plot_style"]
-            agent = p["agent_type"]
-            var = p["variable_name"]
-            fname = p["output_filename"]
-        except KeyError as e:
-            print(f"[FATAL ERROR] Plot specifications at block {idx} lacks component parameter: {e}")
-            sys.exit(1)
+        style = p["plot_style"]
+        agent = p["agent_type"]
+        var = p["variable_name"]
+        fname = p["output_filename"]
         
-        if style in ["box_plot", "histogram", "scatter_plot"]:
-            if "target_iteration" not in p:
-                print(f"[FATAL ERROR] Plot block index {idx} ('{style}') must declare a 'target_iteration'.")
-                sys.exit(1)
-            iterations = _resolve_iterations(p["target_iteration"])
-        else:
-            iterations = [0]
-
-        if style == "scatter_plot" and "secondary_variable" not in p:
-            print(f"[FATAL ERROR] Plot index {idx} ('scatter_plot') must include a 'secondary_variable'.")
-            sys.exit(1)
-
-        if style == "delay_plot" and "delay_lag" not in p:
-            print(f"[FATAL ERROR] Plot index {idx} ('delay_plot') must include a 'delay_lag'.")
-            sys.exit(1)
-
-        print(f"[{idx}/{len(plots)}] Building superimposed layout view '{style}' for '{agent}' class...")
+        iterations = _resolve_iterations(p.get("target_iteration", 0))
+        print(f"[{idx}/{len(plots)}] Processing view '{style}' for '{agent}'...")
         fig = None
 
         if style == "time_series":
@@ -351,14 +290,6 @@ if __name__ == "__main__":
 
         if fig:
             dest = os.path.join(args.output_dir, fname) if args.output_dir else fname
-            dest_dir = os.path.dirname(os.path.abspath(dest))
-            if not os.path.exists(dest_dir): 
-                os.makedirs(dest_dir)
+            os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
             fig.savefig(dest, dpi=300)
             plt.close(fig)
-            total_exported += 1
-            print(f"  -> Saved Superimposed Panel Figure: {dest}")
-        else:
-            print(f"  [Warning] Zero matching values fell inside specified constraints for index block {idx}.")
-            
-    print(f"\nExecution sequence terminated. Total figures written to disk: {total_exported}")
