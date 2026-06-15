@@ -10,13 +10,15 @@ Description:
     
     1. Standardize schemas: [set_num, run_num, time_step, ID, metric1, metric2, ...]
     2. Optimize types: int16/float32 for memory efficiency
-    3. Sort outputs: (set_num, run_num, time_step, ID)
-    4. Generate Feather files: One per agent_type for fast queries
+    3. Apply optional stride filtering for downsampling
+    4. Sort outputs: (set_num, run_num, time_step, ID)
+    5. Generate Feather files: One per agent_type for fast queries
 
 Architecture:
     - Metadata Scan: Quick discovery of agent types and available metrics
     - Parallel Processing: Multi-worker pool processes source files in parallel
-    - Dual Output Accumulation: Collect batches by agent type, then merge & sort
+    - Batch Streaming: 50k row chunks with explicit garbage collection
+    - Stride Filtering: Optional downsampling (e.g., keep every Nth time step)
     - Memory Optimization: Batch streaming (50k rows), explicit garbage collection
 
 Usage Examples:
@@ -27,13 +29,9 @@ Usage Examples:
     python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 \\
         --agent-types "Bank,Firm" --workers 8 --verbose
     
-    # Filter to specific metrics
+    # Filter to specific metrics with stride downsampling
     python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 \\
-        --metrics "wealth,revenue,debt" --workers 8 --verbose
-    
-    # Filter both agents and metrics
-    python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 \\
-        --agent-types "Bank" --metrics "wealth,deposits" --workers 8 --verbose
+        --metrics "wealth,revenue,debt" --stride 2 --workers 8 --verbose
 ================================================================================
 """
 
@@ -161,10 +159,10 @@ def process_source_file(task_args):
     """
     Process one data_{agent_type}.parquet file.
     
-    Standardizes schema, casts types, and returns structured table.
+    Standardizes schema, casts types, applies stride filtering, and returns structured table.
     
     Args:
-        task_args: (file_path, set_num, run_num, agent_type, metrics)
+        task_args: (file_path, set_num, run_num, agent_type, metrics, stride)
     
     Returns:
         {
@@ -173,7 +171,7 @@ def process_source_file(task_args):
         }
         or None on error
     """
-    file_path, set_num, run_num, agent_type, metrics = task_args
+    file_path, set_num, run_num, agent_type, metrics, stride = task_args
     
     try:
         pf = pq.ParquetFile(file_path)
@@ -190,6 +188,16 @@ def process_source_file(task_args):
         
         for batch in pf.iter_batches(batch_size=50_000):
             total_rows = batch.num_rows
+            if total_rows == 0:
+                continue
+            
+            # Apply stride filtering if needed
+            if stride > 1:
+                # Keep rows at indices 0, stride, 2*stride, ...
+                indices = np.arange(0, total_rows, stride, dtype=np.int64)
+                batch = batch.take(indices)
+                total_rows = batch.num_rows
+            
             if total_rows == 0:
                 continue
             
@@ -237,7 +245,7 @@ def process_source_file(task_args):
 
 
 def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir, 
-                    verbose=False, filter_agents=None, filter_metrics=None):
+                    verbose=False, stride=1, filter_agents=None, filter_metrics=None):
     """
     Unified ETL: Auto-detect agent types and metrics, process in parallel.
     
@@ -248,6 +256,7 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
         num_workers: Number of parallel workers
         output_dir: Output directory for Feather files
         verbose: Verbose logging
+        stride: Stride for downsampling (default 1 = no downsampling)
         filter_agents: Optional list of agent types to include (if None, auto-detect all)
         filter_metrics: Optional list of metrics to include (if None, auto-detect all)
     """
@@ -288,6 +297,8 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
     
     if verbose:
         print(f"[INFO] Discovered metrics: {all_metrics}")
+        if stride > 1:
+            print(f"[INFO] Stride filtering enabled: keeping every {stride}th row")
     
     # Build file manifest
     file_manifest = build_file_manifest(root_dir, agent_types, set_range, run_range)
@@ -307,9 +318,9 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
     agent_tables = defaultdict(list)
     processed_count = 0
     
-    # Prepare task args with all_metrics included
+    # Prepare task args with all_metrics and stride included
     task_args_list = [
-        (fp, sn, rn, at, all_metrics) 
+        (fp, sn, rn, at, all_metrics, stride) 
         for fp, sn, rn, at in file_manifest
     ]
     
@@ -382,6 +393,8 @@ if __name__ == '__main__':
                        help="[Optional] Comma-separated agent types to include (default: auto-detect all)")
     parser.add_argument('--metrics', default=None,
                        help="[Optional] Comma-separated metrics to include (default: auto-detect all)")
+    parser.add_argument('--stride', type=int, default=1,
+                       help="[Optional] Stride for downsampling (keep every Nth row, default: 1 = no downsampling)")
     parser.add_argument('--workers', type=int, default=1, 
                        help="Number of parallel workers (default: 1)")
     parser.add_argument('--verbose', action='store_true', 
@@ -411,6 +424,7 @@ if __name__ == '__main__':
         num_workers=args.workers,
         output_dir=args.output,
         verbose=args.verbose,
+        stride=args.stride,
         filter_agents=filter_agents,
         filter_metrics=filter_metrics
     )
