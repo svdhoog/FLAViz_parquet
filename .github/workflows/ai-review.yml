@@ -7,8 +7,13 @@ on:
 jobs:
   review:
     # Only run if the comment is on a Pull Request AND matches the exact command
-    if: ${{ github.event.issue.pull_request && github.event.comment.body == '/review' }}
+    # AND only run if the comment author's username matches your specific handle
+    if: >
+      github.event.issue.pull_request && 
+      github.event.comment.body == '/review' && 
+      github.actor == 'svdhoog'
     runs-on: ubuntu-latest
+    timeout-minutes: 5    # Force-kills the runner if it takes longer than 5 minutes
     permissions:
       pull-requests: write
       contents: read
