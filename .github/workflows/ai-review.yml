@@ -1,21 +1,32 @@
 name: Automated AI Code Review
 
 on:
-  pull_request_target:
-    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
 
 jobs:
   review:
+    # Only run if the comment is on a Pull Request AND matches the exact command
+    if: ${{ github.event.issue.pull_request && github.event.comment.body == '/review' }}
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents: read
+      issue-comments: write
 
     steps:
       - name: Check out repository source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+
+      # When running on a comment, we must explicitly fetch the PR details to get the diff
+      - name: Extract Pull Request Diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Use the GitHub CLI tool built into the runner to fetch the raw diff
+          gh pr diff ${{ github.event.issue.number }} > pr_diff.txt
+          echo "DIFF_PATH=pr_diff.txt" >> $GITHUB_ENV
 
       - name: Set up Python environment
         uses: actions/setup-python@v5
@@ -24,21 +35,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install openai requests
-          
-      - name: Extract Pull Request Diff
-        id: diff
-        run: |
-          # Fetch the raw diff comparing the PR branch against the target branch
-          git diff origin/${{ github.base_ref }}...origin/${{ github.head_ref }} > pr_diff.txt
-          echo "DIFF_PATH=pr_diff.txt" >> $GITHUB_ENV
+          pip install openai
 
       - name: Execute OpenRouter Review Selection
         id: openrouter_step
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          # Read the diff content safely into an environment variable
           export PR_DIFF=$(cat pr_diff.txt)
           python review_pr.py > review_response.txt
 
@@ -55,6 +58,6 @@ jobs:
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: "### 🤖 Automated AI Code Review via OpenRouter\n\n" + reviewBody
+                body: "### 🤖 Requested AI Code Review via OpenRouter\n\n" + reviewBody
               });
             }
