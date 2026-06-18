@@ -200,10 +200,18 @@ def process_source_file(task_args):
             
             # Apply stride filtering if needed
             if stride > 1:
-                # Keep rows at indices 0, stride, 2*stride, ...
-                indices = np.arange(0, total_rows, stride, dtype=np.int64)
-                batch = batch.take(indices)
-                total_rows = batch.num_rows
+                # Filter by time_col, not row index:
+                # Keep time_col rows at indices 0, stride, 2*stride, ...
+                time_arr = batch.column(time_col)
+                
+                # Typically, 'time_step' equals values (0,20,40,...), so stride should be a multiple of 20.
+                # If time steps are 0-based and you want to keep 0, stride, 2*stride, ..., use:
+                mask = pc.equal(pc.modulo(time_arr, pa.scalar(stride, type=time_arr.type)), 0)
+                
+                # If time steps are 1-based and you want to keep 1, 1 + stride, ..., use:
+                #mask = pc.equal(pc.modulo(pc.subtract(time_arr, 1), stride), 0)
+
+                batch = batch.filter(mask)
             
             if total_rows == 0:
                 continue
