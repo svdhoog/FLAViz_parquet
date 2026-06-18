@@ -205,7 +205,7 @@ def process_source_file(task_args):
             arrays = [
                 pa.array(np.repeat(set_num, total_rows, dtype=np.int16)),
                 pa.array(np.repeat(run_num, total_rows, dtype=np.int16)),
-                batch.column(time_col).cast(pa.int16()),
+                batch.column(time_col).cast(pa.int64()),
             ]
             names = ['set_num', 'run_num', 'time_step']
             
@@ -213,7 +213,7 @@ def process_source_file(task_args):
             if id_col:
                 id_type = batch.column(id_col).type
                 arrays.append(batch.column(id_col).cast(
-                    pa.int16() if pa.types.is_integer(id_type) else pa.int64()
+                    pa.int64()
                 ))
                 names.append('ID')
             
@@ -224,7 +224,7 @@ def process_source_file(task_args):
                     if pa.types.is_floating(col_type):
                         arrays.append(batch.column(metric).cast(pa.float32()))
                     elif pa.types.is_integer(col_type):
-                        arrays.append(batch.column(metric).cast(pa.int16()))
+                        arrays.append(batch.column(metric).cast(pa.int64()))
                     else:
                         arrays.append(batch.column(metric))
                     names.append(metric)
