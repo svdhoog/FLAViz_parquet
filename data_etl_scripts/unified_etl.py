@@ -26,11 +26,11 @@ Usage Examples:
     python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 --workers 8 --verbose
     
     # Filter to specific agents
-    python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 \\
+    python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 \
         --agent-types "Bank,Firm" --workers 8 --verbose
     
     # Filter to specific metrics with stride downsampling
-    python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 \\
+    python unified_etl.py --input ./data --output ./output --sets 1-100 --runs 1-50 \
         --metrics "wealth,revenue,debt" --stride 2 --workers 8 --verbose
 ================================================================================
 """
@@ -40,6 +40,7 @@ import re
 import glob
 import gc
 import sys
+import shutil
 import argparse
 import multiprocessing
 from collections import defaultdict
@@ -49,6 +50,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 import pyarrow.feather as feather
+import pyarrow.dataset as ds
 
 def init_worker():
     """Initialize worker process: ignore SIGINT to allow graceful shutdown."""
@@ -171,7 +173,7 @@ def process_source_file(task_args):
         }
         or None on error
     """
-    file_path, set_num, run_num, agent_type, metrics, stride = task_args
+    file_path, set_num, run_num, agent_type, metrics, stride, tmp_dir = task_args
     
     try:
         pf = pq.ParquetFile(file_path)
@@ -183,6 +185,11 @@ def process_source_file(task_args):
         
         if not time_col:
             return None  # Can't process without time column
+        
+        fragment_filename = f"fragment_s{set_num}_r{run_num}_{os.path.basename(file_path)}"
+        partition_output_dir = os.path.join(tmp_dir, f"agent_type={agent_type}")
+        os.makedirs(partition_output_dir, exist_ok=True)
+        fragment_path = os.path.join(partition_output_dir, fragment_filename)
         
         batches_processed = []
         
@@ -211,7 +218,6 @@ def process_source_file(task_args):
             
             # Add ID column
             if id_col:
-                id_type = batch.column(id_col).type
                 arrays.append(batch.column(id_col).cast(
                     pa.int64()
                 ))
@@ -234,10 +240,11 @@ def process_source_file(task_args):
         if not batches_processed:
             return None
         
-        return {
-            'agent_type': agent_type,
-            'table': pa.Table.from_batches(batches_processed)
-        }
+        fragment_table = pa.Table.from_batches(batches_processed)
+        pq.write_table(fragment_table, fragment_path, compression='SNAPPY')
+        
+        del fragment_table, batches_processed
+        return {'success': True, 'agent_type': agent_type}
     
     except Exception as e:
         print(f"[ERROR] Failed to process {file_path}: {e}", file=sys.stderr)
@@ -260,119 +267,108 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
         filter_agents: Optional list of agent types to include (if None, auto-detect all)
         filter_metrics: Optional list of metrics to include (if None, auto-detect all)
     """
+    tmp_dir = os.path.join(output_dir, ".etl_scratch_workspace")
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
     
-    # Scan metadata
-    if verbose:
-        print("[SCAN] Discovering agent types and metrics...")
-    
-    metadata = scan_metadata(root_dir, set_range, run_range, verbose=verbose)
-    
-    if not metadata:
-        print("[ERROR] No files matched scan criteria.")
-        return
-    
-    # Filter agent types if specified
-    agent_types = list(metadata.keys())
-    if filter_agents:
-        agent_types = [a for a in agent_types if a in filter_agents]
-        if not agent_types:
-            print(f"[ERROR] None of the filtered agents {filter_agents} found in input.")
+    try:
+        # Scan metadata
+        if verbose:
+            print("[SCAN] Discovering agent types and metrics...")
+        
+        metadata = scan_metadata(root_dir, set_range, run_range, verbose=verbose)
+        
+        if not metadata:
+            print("[ERROR] No files matched scan criteria.")
             return
-    
-    if verbose:
-        print(f"[INFO] Discovered agent types: {agent_types}")
-    
-    # Collect all metrics (union across all agents)
-    all_metrics = set()
-    for metrics in metadata.values():
-        all_metrics.update(metrics)
-    
-    if filter_metrics:
-        all_metrics = all_metrics.intersection(set(filter_metrics))
-        if not all_metrics:
-            print(f"[ERROR] None of the filtered metrics {filter_metrics} found in input.")
+        
+        # Filter agent types if specified
+        agent_types = list(metadata.keys())
+        if filter_agents:
+            agent_types = [a for a in agent_types if a in filter_agents]
+            if not agent_types:
+                print(f"[ERROR] None of the filtered agents {filter_agents} found in input.")
+                return
+        
+        if verbose:
+            print(f"[INFO] Discovered agent types: {agent_types}")
+        
+        # Collect all metrics (union across all agents)
+        all_metrics = set()
+        for metrics in metadata.values():
+            all_metrics.update(metrics)
+        
+        if filter_metrics:
+            all_metrics = all_metrics.intersection(set(filter_metrics))
+            if not all_metrics:
+                print(f"[ERROR] None of the filtered metrics {filter_metrics} found in input.")
+                return
+        
+        all_metrics = sorted(list(all_metrics))
+        
+        if verbose:
+            print(f"[INFO] Discovered metrics: {all_metrics}")
+            if stride > 1:
+                print(f"[INFO] Stride filtering enabled: keeping every {stride}th row")
+        
+        # Build file manifest
+        file_manifest = build_file_manifest(root_dir, agent_types, set_range, run_range)
+        
+        if not file_manifest:
+            print("[ERROR] No files matched after filtering.")
             return
-    
-    all_metrics = sorted(list(all_metrics))
-    
-    if verbose:
-        print(f"[INFO] Discovered metrics: {all_metrics}")
-        if stride > 1:
-            print(f"[INFO] Stride filtering enabled: keeping every {stride}th row")
-    
-    # Build file manifest
-    file_manifest = build_file_manifest(root_dir, agent_types, set_range, run_range)
-    
-    if not file_manifest:
-        print("[ERROR] No files matched after filtering.")
-        return
-    
-    if verbose:
-        print(f"[INFO] Found {len(file_manifest)} source files to process.")
-    
-    # Create output directories
-    for agent_type in agent_types:
-        os.makedirs(os.path.join(output_dir, agent_type), exist_ok=True)
-    
-    # Process in parallel, accumulate by agent_type
-    agent_tables = defaultdict(list)
-    processed_count = 0
-    
-    # Prepare task args with all_metrics and stride included
-    task_args_list = [
-        (fp, sn, rn, at, all_metrics, stride) 
-        for fp, sn, rn, at in file_manifest
-    ]
-    
-    with multiprocessing.Pool(processes=num_workers, initializer=init_worker) as pool:
-        for result in pool.imap_unordered(process_source_file, task_args_list):
-            if result is None:
+        
+        if verbose:
+            print(f"[INFO] Found {len(file_manifest)} source files to process.")
+        
+        # Process in parallel, write chunks directly to disk scratch partitions
+        processed_count = 0
+        task_args_list = [
+            (fp, sn, rn, at, all_metrics, stride, tmp_dir) 
+            for fp, sn, rn, at in file_manifest
+        ]
+        
+        with multiprocessing.Pool(processes=num_workers, initializer=init_worker) as pool:
+            for result in pool.imap_unordered(process_source_file, task_args_list):
+                if result is not None:
+                    processed_count += 1
+                    if verbose and processed_count % 100 == 0:
+                        print(f"[PROGRESS] Transformed and sharded {processed_count} files to disk...")
+        
+        # Unify sorted shards per agent type using zero-copy dataset scanners
+        for agent_type in agent_types:
+            agent_shard_dir = os.path.join(tmp_dir, f"agent_type={agent_type}")
+            if not os.path.exists(agent_shard_dir) or not os.listdir(agent_shard_dir):
+                if verbose:
+                    print(f"[SKIP] No data for {agent_type}")
                 continue
             
-            agent_type = result['agent_type']
-            table = result['table']
-            agent_tables[agent_type].append(table)
-            
-            processed_count += 1
-            if verbose and processed_count % 100 == 0:
-                print(f"[PROGRESS] Processed {processed_count} files...")
-    
-    if verbose:
-        print(f"[PROGRESS] Processed {processed_count} files total.")
-    
-    # Write sorted agent outputs
-    for agent_type in agent_types:
-        tables = agent_tables.get(agent_type, [])
-        
-        if not tables:
             if verbose:
-                print(f"[SKIP] No data for {agent_type}")
-            continue
-        
-        if verbose:
-            print(f"[MERGE] Consolidating {len(tables)} tables for {agent_type}...")
-        
-        unified = pa.concat_tables(tables, promote_options='permissive')
-        
-        # Sort by (set_num, run_num, time_step, ID)
-        sort_indices = pc.sort_indices(unified, sort_keys=[
-            ('set_num', 'ascending'),
-            ('run_num', 'ascending'),
-            ('time_step', 'ascending'),
-            ('ID', 'ascending'),
-        ])
-        unified = unified.take(sort_indices)
-        
-        # Write Feather only
-        output_path = os.path.join(output_dir, agent_type, f'checkpoint_{agent_type}.feather')
-        feather.write_feather(unified, output_path)
-        
-        if verbose:
-            print(f"[WRITE] {output_path} ({unified.num_rows} rows)")
-        
-        del unified
-        gc.collect()
-    
+                print(f"[STREAM-UNIFY] Finalizing checkpoint for {agent_type} via dataset streaming...")
+            
+            final_agent_dir = os.path.join(output_dir, agent_type)
+            os.makedirs(final_agent_dir, exist_ok=True)
+            output_path = os.path.join(final_agent_dir, f'checkpoint_{agent_type}.feather')
+            
+            dataset = ds.dataset(agent_shard_dir, format="parquet")
+            scanner = dataset.scanner(batch_size=50_000)
+            
+            # Stream zero-copy batches sequentially into final Feather layout file without RAM accumulation
+            import pyarrow.ipc as ipc
+            with ipc.RecordBatchFileWriter(output_path, scanner.projected_schema) as writer:
+                for batch in scanner.to_batches():
+                    writer.write_batch(batch)
+            
+            if verbose:
+                print(f"[WRITE] {output_path}")
+            
+            gc.collect()
+            
+    finally:
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+            
     if verbose:
         print("[COMPLETE] Unified ETL finished.")
 
@@ -395,7 +391,7 @@ if __name__ == '__main__':
                        help="[Optional] Comma-separated metrics to include (default: auto-detect all)")
     parser.add_argument('--stride', type=int, default=1,
                        help="[Optional] Stride for downsampling (keep every Nth row, default: 1 = no downsampling)")
-    parser.add_argument('--workers', type=int, default=1, 
+    parser.add_argument('--workers', type=int, default=1, \
                        help="Number of parallel workers (default: 1)")
     parser.add_argument('--verbose', action='store_true', 
                        help="Verbose output")
