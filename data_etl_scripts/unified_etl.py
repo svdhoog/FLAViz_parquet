@@ -208,10 +208,10 @@ def process_source_file(task_args):
             if total_rows == 0:
                 continue
             
-            # Build standardized columns
+            # Build standardized columns using np.full with int32 specifications
             arrays = [
-                pa.array(np.repeat(set_num, total_rows, dtype=np.int16)),
-                pa.array(np.repeat(run_num, total_rows, dtype=np.int16)),
+                pa.array(np.full(total_rows, set_num, dtype=np.int32)),
+                pa.array(np.full(total_rows, run_num, dtype=np.int32)),
                 batch.column(time_col).cast(pa.int64()),
             ]
             names = ['set_num', 'run_num', 'time_step']
