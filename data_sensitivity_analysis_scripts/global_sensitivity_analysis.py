@@ -121,18 +121,30 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
     param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
     
     # Calculate percentile threshold (sampling pass)
-    log(f"[ANALYSIS] Calculating global threshold...", verbose)
+    log(f"[ANALYSIS] Calculating global metric boundaries...", verbose)
     sample_points = []
     it, _ = get_iterator(checkpoint_path, file_format, [metric])
+    
     for batch in it:
         sample_points.append(batch.column(metric).to_numpy())
         if sum(len(s) for s in sample_points) > 1_000_000:
             break
-    threshold = np.percentile(np.concatenate(sample_points), percentile_limit)
-    del sample_points
-    gc.collect()
-    log(f"  -> Threshold set at {threshold:.4f} (percentile {percentile_limit})", verbose)
+            
+    metric_sample = np.concatenate(sample_points)
+    finite_metric_sample = metric_sample[np.isfinite(metric_sample)]
     
+    # Calculate a symmetric lower bound to exclude extreme negative outliers
+    # If percentile_limit is 99, this sets the floor at the 1st percentile
+    lower_percentile = 100.0 - percentile_limit
+
+    lower = np.percentile(finite_metric_sample, lower_percentile)
+    upper = np.percentile(finite_metric_sample, percentile_limit)
+    
+    del sample_points, metric_sample, finite_metric_sample
+    gc.collect()
+    
+    log(f"  -> Metric Range: Floor = {lower:.4f} (0%), Ceiling = {upper:.4f} ({percentile_limit}%)", verbose)
+
     # Identify economic parameters (exclude metadata columns)
     economic_params = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_num'}]
     
@@ -144,14 +156,16 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
         # Pre-compute bin edges
         hist_grid = np.zeros((500, 500))
         x_edges = np.linspace(param_vector.min(), param_vector.max(), 501)
-        y_edges = np.linspace(0, threshold, 501)
+
+        # Fix negative metric values
+        y_edges = np.linspace(lower, upper, 501)
         
         # Stream batches, accumulate histogram
         it, source = get_iterator(checkpoint_path, file_format, ['set_num', metric])
         for batch in it:
             sets = batch.column('set_num').to_numpy()
             vals = batch.column(metric).to_numpy()
-            mask = (vals <= threshold) & (vals >= 0)
+            mask = np.isfinite(vals) & (vals >= lower) & (vals <= upper)
             
             if np.any(mask):
                 H, _, _ = np.histogram2d(
