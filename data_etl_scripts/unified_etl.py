@@ -48,7 +48,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
-
+import pyarrow.feather as feather
 
 def init_worker():
     """Initialize worker process: ignore SIGINT to allow graceful shutdown."""
@@ -365,7 +365,7 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
         
         # Write Feather only
         output_path = os.path.join(output_dir, agent_type, f'checkpoint_{agent_type}.feather')
-        pa.ipc.write_feather(unified, output_path)
+        feather.write_feather(unified, output_path)
         
         if verbose:
             print(f"[WRITE] {output_path} ({unified.num_rows} rows)")
