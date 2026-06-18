@@ -126,14 +126,22 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
     it, _ = get_iterator(checkpoint_path, file_format, [metric])
     
     for batch in it:
+        if metric not in batch.schema.names:
+            raise ValueError(f"Metric {metric!r} not found in checkpoint")
         sample_points.append(batch.column(metric).to_numpy())
         if sum(len(s) for s in sample_points) > 1_000_000:
             break
-            
+    
+    if not sample_points:
+        raise ValueError(f"No finite values found for metric {metric!r}")
+
     metric_sample = np.concatenate(sample_points)
     finite_metric_sample = metric_sample[np.isfinite(metric_sample)]
-    
+
     # Calculate a symmetric lower bound to exclude extreme negative outliers
+    if not 0 <= percentile_limit <= 100:
+        raise ValueError("--percentile must be between 0 and 100")
+
     # If percentile_limit is 99, this sets the floor at the 1st percentile
     lower_percentile = 100.0 - percentile_limit
 
