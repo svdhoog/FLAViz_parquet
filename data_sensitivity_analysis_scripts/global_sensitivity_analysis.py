@@ -81,7 +81,7 @@ def log(message, verbose=False):
 
 def get_iterator(checkpoint_path, file_format, columns):
     """
-    Open iterator over checkpoint file (Feather or Parquet).
+    Open optimized iterator over checkpoint file (Feather or Parquet).
     
     Args:
         checkpoint_path: Path to .feather or .parquet file
@@ -92,12 +92,13 @@ def get_iterator(checkpoint_path, file_format, columns):
         (iterator, source) where source is file handle for cleanup
     """
     if file_format == 'feather':
-        source = pa.memory_map(checkpoint_path, 'rb')
-        reader = ipc.RecordBatchFileReader(source)
-        return (reader.get_batch(i) for i in range(reader.num_record_batches)), source
+        import pyarrow.feather as feather
+        # Read only the selected columns into a localized PyArrow Table
+        table = feather.read_table(checkpoint_path, columns=columns)
+        # Convert to an iterable batch list matching the chunk sizing of the Parquet pipeline
+        return table.to_batches(max_chunksize=50_000), None
     else:  # parquet
         return pq.ParquetFile(checkpoint_path).iter_batches(batch_size=50_000, columns=columns), None
-
 
 def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir, 
                                parameters_file_path, percentile_limit, verbose):
