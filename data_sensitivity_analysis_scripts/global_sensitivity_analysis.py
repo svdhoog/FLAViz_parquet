@@ -32,6 +32,10 @@ Usage:
 
 import os
 import sys
+
+# Configure environment variables before loading native compiled libraries
+os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"})
+
 import gc
 import time
 import argparse
