@@ -44,8 +44,8 @@ import pyarrow.parquet as pq
 import pyarrow.ipc as ipc
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
 
 
 class LiveMemoryProfiler(threading.Thread):
@@ -145,7 +145,6 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
                 
         sample_points.append(batch.column(metric).to_numpy())
         if sum(len(s) for s in sample_points) > 1_000_000:
-            # Continue scanning the rest of the file briefly if we need to guarantee set_num bounds
             break
             
     # Complete scanning to verify full set_num bounds across the entire checkpoint file
@@ -168,6 +167,9 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
     metric_sample = np.concatenate(sample_points)
     finite_metric_sample = metric_sample[np.isfinite(metric_sample)]
 
+    if len(finite_metric_sample) == 0:
+        raise ValueError(f"No valid finite numbers located inside metric target column {metric!r}")
+
     # Calculate a symmetric lower bound to exclude extreme negative outliers
     if not 0 <= percentile_limit <= 100:
         raise ValueError("--percentile must be between 0 and 100")
@@ -178,10 +180,19 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
     lower = np.percentile(finite_metric_sample, lower_percentile)
     upper = np.percentile(finite_metric_sample, percentile_limit)
     
+    # Handle degenerate metric coordinates (ymin == ymax)
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        raise ValueError(f"Calculated percentile bounds for metric {metric!r} are non-finite.")
+        
+    if lower == upper:
+        y_pad = abs(lower) * 0.01 or 1.0
+        lower -= y_pad
+        upper += y_pad
+    
     del sample_points, metric_sample, finite_metric_sample
     gc.collect()
     
-    log(f"  -> Metric Range: Floor = {lower:.4f} (0%), Ceiling = {upper:.4f} ({percentile_limit}%)", verbose)
+    log(f"  -> Metric Range: Floor = {lower:.4f} ({lower_percentile}%), Ceiling = {upper:.4f} ({percentile_limit}%)", verbose)
 
     # Identify economic parameters (exclude metadata columns)
     economic_params = [c for c in param_meta_df.columns if c not in {'run_num', 'time_step', 'set_num'}]
@@ -190,47 +201,54 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
     for param_name in economic_params:
         log(f"[RENDER] Creating plot for {param_name.upper()}...", verbose)
         
-        # Build an explicit mapping array with validation bounds
+        # Build an explicit mapping array with validation bounds using the requested name
         max_set_index = int(max(param_meta_df.index.max(), checkpoint_max_set))
-        lookup = np.full(max_set_index + 1, np.nan, dtype=np.float32)
-        lookup[param_meta_df.index.to_numpy()] = param_meta_df[param_name].to_numpy(dtype=np.float32)
+        param_vector = np.full(max_set_index + 1, np.nan, dtype=np.float32)
+        param_vector[param_meta_df.index.to_numpy()] = param_meta_df[param_name].to_numpy(dtype=np.float32)
         
-        # Pre-compute bin edges
+        # Calculate x-axis bounds and safely resolve degenerate values
+        x_min = np.nanmin(param_vector)
+        x_max = np.nanmax(param_vector)
+        
+        if not np.isfinite(x_min) or not np.isfinite(x_max):
+            log(f"[SKIP] {param_name}: no finite parameter values", verbose)
+            continue
+            
+        if x_min == x_max:
+            x_pad = abs(x_min) * 0.01 or 1.0
+            x_min -= x_pad
+            x_max += x_pad
+        
+        # Pre-compute non-degenerate bin edges
         hist_grid = np.zeros((500, 500))
-        x_edges = np.linspace(np.nanmin(lookup), np.nanmax(lookup), 501)
-
-        # Fix negative metric values
+        x_edges = np.linspace(x_min, x_max, 501)
         y_edges = np.linspace(lower, upper, 501)
         
         # Stream batches, accumulate histogram
         it, source = get_iterator(checkpoint_path, file_format, ['set_num', metric])
-        try:
-            for batch in it:
-                sets = batch.column('set_num').to_numpy()
-                vals = batch.column(metric).to_numpy()
-                mask = np.isfinite(vals) & (vals >= lower) & (vals <= upper)
+        for batch in it:
+            sets = batch.column('set_num').to_numpy()
+            vals = batch.column(metric).to_numpy()
+            mask = np.isfinite(vals) & (vals >= lower) & (vals <= upper)
+            
+            if np.any(mask):
+                set_values = sets[mask].astype(np.int64)
                 
-                if np.any(mask):
-                    set_values = sets[mask].astype(np.int64)
-                    
-                    # Check bounds and ensure value is safely mapped inside the metadata lookup array
-                    valid = (set_values >= 0) & (set_values < len(lookup)) & np.isfinite(lookup[set_values])
-                    
-                    if np.any(valid):
-                        x_coords = lookup[set_values[valid]]
-                        y_coords = vals[mask][valid]
-                        
-                        H, _, _ = np.histogram2d(
-                            x_coords,
-                            y_coords,
-                            bins=[x_edges, y_edges]
-                        )
-                        hist_grid += H
+                # Check bounds and ensure value is safely mapped inside the metadata vector map
+                valid = (set_values >= 0) & (set_values < len(param_vector)) & np.isfinite(param_vector[set_values])
                 
-                del sets, vals, mask
-        finally:
-            if source:
-            source.close()
+                if np.any(valid):
+                    x_coords = param_vector[set_values[valid]]
+                    y_coords = vals[mask][valid]
+                    
+                    H, _, _ = np.histogram2d(
+                        x_coords,
+                        y_coords,
+                        bins=[x_edges, y_edges]
+                    )
+                    hist_grid += H
+            
+            del sets, vals, mask
         
         # Render and save
         fig, ax = plt.subplots(figsize=(11, 6))
@@ -254,7 +272,7 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
         if verbose:
             print(f"[WRITE] {output_path}")
         
-        del lookup, hist_grid, fig, ax
+        del param_vector, hist_grid, fig, ax
         if source:
             source.close()
         gc.collect()
