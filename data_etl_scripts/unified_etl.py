@@ -44,7 +44,6 @@ os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM
 import re
 import glob
 import gc
-import sys
 import argparse
 import multiprocessing
 from collections import defaultdict
@@ -54,6 +53,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 import pyarrow.feather as feather
+
 
 def init_worker():
     """Initialize worker process: ignore SIGINT to allow graceful shutdown."""
@@ -84,18 +84,15 @@ def scan_metadata(root_dir, set_range, run_range, verbose=False):
         
         set_match = re.fullmatch(r"set_(\d+)", parts[-3])
         run_match = re.fullmatch(r"run_(\d+)", parts[-2])
-
         filename = parts[-1]
+        
         m = re.fullmatch(r"data_(.+)\.parquet", filename)
-        if not m:
+        if not (set_match and run_match and m):
             continue
+        
         agent_type = m.group(1)
-        
-        if not (set_match and run_match):
-            continue
-        
-        set_num = int(set_match.group())
-        run_num = int(run_match.group())
+        set_num = int(set_match.group(1))
+        run_num = int(run_match.group(1))
         
         if not (set_range[0] <= set_num <= set_range[1] and
                 run_range[0] <= run_num <= run_range[1]):
@@ -141,16 +138,17 @@ def build_file_manifest(root_dir, agent_types, set_range, run_range):
     for file_path in glob.iglob(glob_pattern.replace("\\", "/")):
         parts = file_path.replace("\\", "/").split("/")
         
-        set_match = re.search(r'\d+', parts[-3])
-        run_match = re.search(r'\d+', parts[-2])
+        set_match = re.fullmatch(r"set_(\d+)", parts[-3])
+        run_match = re.fullmatch(r"run_(\d+)", parts[-2])
         filename = parts[-1]
-        agent_type = filename.replace("data_", "").replace(".parquet", "")
         
-        if not (set_match and run_match):
+        m = re.fullmatch(r"data_(.+)\.parquet", filename)
+        if not (set_match and run_match and m):
             continue
         
-        set_num = int(set_match.group())
-        run_num = int(run_match.group())
+        agent_type = m.group(1)
+        set_num = int(set_match.group(1))
+        run_num = int(run_match.group(1))
         
         # Filter by agent_type and ranges
         if agent_type not in agent_types:
@@ -428,8 +426,6 @@ if __name__ == '__main__':
     filter_metrics = None
     if args.metrics:
         filter_metrics = [m.strip() for m in args.metrics.split(',')]
-    
-    os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"})
     
     run_unified_etl(
         root_dir=args.input,
