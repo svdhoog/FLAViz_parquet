@@ -83,6 +83,27 @@ def log(message, verbose=False):
         print(f"[{time.strftime('%H:%M:%S')}] {message}")
 
 
+def validate_checkpoint_schema(path, file_format, required_columns):
+    """
+    Validate that the checkpoint file contains all required columns.
+    
+    Args:
+        path: Path to the checkpoint file
+        file_format: 'feather' or 'parquet'
+        required_columns: List of columns that must be present
+    """
+    if file_format == "parquet":
+        names = pq.ParquetFile(path).schema.names
+    else:
+        with pa.memory_map(path, "rb") as source:
+            reader = ipc.RecordBatchFileReader(source)
+            names = reader.schema.names
+
+    missing = set(required_columns) - set(names)
+    if missing:
+        raise ValueError(f"Checkpoint missing required columns: {sorted(missing)}")
+
+
 def get_iterator(checkpoint_path, file_format, columns):
     """
     Open optimized iterator over checkpoint file (Feather or Parquet).
@@ -315,10 +336,11 @@ if __name__ == '__main__':
     if not os.path.exists(args.parameters):
         print(f"[ERROR] Parameters file not found: {args.parameters}")
         sys.exit(1)
+        
+    # Validate checkpoint file schema before running multi-pass processing
+    validate_checkpoint_schema(args.checkpoint, args.format, ["set_num", args.metric])
     
     os.makedirs(args.output, exist_ok=True)
-    
-    os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"})
     
     # Optional memory profiling
     profiler = None
