@@ -82,10 +82,14 @@ def scan_metadata(root_dir, set_range, run_range, verbose=False):
     for file_path in glob.iglob(glob_pattern.replace("\\", "/")):
         parts = file_path.replace("\\", "/").split("/")
         
-        set_match = re.search(r'\d+', parts[-3])
-        run_match = re.search(r'\d+', parts[-2])
+        set_match = re.fullmatch(r"set_(\d+)", parts[-3])
+        run_match = re.fullmatch(r"run_(\d+)", parts[-2])
+
         filename = parts[-1]
-        agent_type = filename.replace("data_", "").replace(".parquet", "")
+        m = re.fullmatch(r"data_(.+)\.parquet", filename)
+        if not m:
+            continue
+        agent_type = m.group(1)
         
         if not (set_match and run_match):
             continue
