@@ -185,8 +185,8 @@ def process_source_file(task_args):
         col_names = pf.schema.names
         
         # Identify time and ID columns
-        time_col = next((c for c in ['time_step', 'iteration', 'tick'] if c in col_names), None)
-        id_col = next((c for c in ['ID', 'id', 'agent_id'] if c in col_names), None)
+        time_col = next((c for c in ['_ITERATION_NO', 'iteration', 'itno', 'time_step', 'tick'] if c in col_names), None)
+        id_col = next((c for c in ['ID', 'id', 'agent_id', 'agent_no', 'agent_nr'] if c in col_names), None)
         
         if not time_col:
             return None  # Can't process without time column

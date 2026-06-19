@@ -3,8 +3,8 @@
 #Usage:
 #python unified_etl.py --input ./parquet_folder_hierarchy --output ./pqt_folder
 
-#Circles test model
-INPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data/input/pqt'
+#Circles test model --sets 1-4 --runs 1-2
+INPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data/output/pqt'
 OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data/output/png_flat'
 
 #ABM large, --sets 4-5 --runs 1-2
@@ -39,4 +39,3 @@ python flaviz_parquet_plot.py \
 		--input "$INPUT_DIR" \
 		--output-dir "$OUTPUT_DIR" \
 		--config ./config/test_config_1.json
-

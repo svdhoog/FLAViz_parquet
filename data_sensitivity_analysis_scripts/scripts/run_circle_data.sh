@@ -3,8 +3,8 @@
 # Hierarchy: set_n/run_M/data_Agent.Parquet files
 INPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data/output/pqt'
 
-# Flat data_Agent.Parquet files + GSA Bifurcation Plots
-OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data/output/pqt_flat'
+# Flat data_Agent.Parquet files
+OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data/etl_output/pqt'
 #OUTPUT_FILE='gsa_summary.txt'
 
 SAMPLE_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/test_models/circle/test_data'
@@ -15,14 +15,14 @@ METRICS=("r" "a" "b")
 
 ## REFACTORED VERSION (15 June 2026)
 # Usage:
-# python global_sensitivity_analysis.py \
-#   --checkpoint ./etl_output/Bank/checkpoint_Bank.feather \
-#   --parameters ./params.csv \
-#   --metric wealth \
-#   --output ./plots \
-#   --percentile 95 \
-#   --verbose
-# >"logs/${m}_stdout.log" 2>"logs/${m}_stderr.log"
+python global_sensitivity_analysis.py \
+  --checkpoint "$OUTPUT_DIR/Bank/checkpoint_Agent.feather" \
+  --parameters "$SAMPLE_DIR/$SAMPLE_FILE" \
+  --metric "a" \
+  --output "$OUTPUT_DIR" \
+  --percentile 95 \
+  --verbose
+>"logs/${m}_stdout.log" 2>"logs/${m}_stderr.log"
 
 #   Changes needed:
 #   - change --checkpoint into --input
