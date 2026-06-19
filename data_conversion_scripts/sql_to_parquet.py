@@ -10,7 +10,7 @@ Description:
     skipping logic, and system memory leak protections.
 
 Usage Syntax:
-    $ python sql_to_parquet.py --input ./legacy_sql_runs \\
+    $ python sql_to_parquet.py --input ./legacy_sql_runs \
         --output ./parquet_mirror --sets 1-513 --runs 1-1000 --force
 
 Command-Line Arguments & Flags:
@@ -77,12 +77,23 @@ def convert_single_sqlite_to_parquet(task_args):
         current_dir = os.path.dirname(db_abs)
         
         legacy_components = parse_legacy_flat_filename(filename)
+        rel_subpath = os.path.relpath(current_dir, os.path.abspath(root_input))
+        
         if legacy_components:
             set_dir, run_dir = legacy_components
-            rel_parent = os.path.relpath(current_dir, os.path.abspath(root_input))
-            target_out = os.path.normpath(os.path.join(root_output, rel_parent, set_dir, run_dir)) if rel_parent != '.' else os.path.normpath(os.path.join(root_output, set_dir, run_dir))
+            path_parts = rel_subpath.replace("\\", "/").split("/")
+            
+            out_parts = [root_output]
+            if rel_subpath != '.':
+                out_parts.append(rel_subpath)
+            if set_dir not in path_parts:
+                out_parts.append(set_dir)
+            if run_dir not in path_parts:
+                out_parts.append(run_dir)
+                
+            target_out = os.path.normpath(os.path.join(*out_parts))
         else:
-            rel_subpath = os.path.relpath(current_dir, os.path.abspath(root_input))
+            # If folders already match set_*/run_*, rel_subpath natively contains them.
             target_out = os.path.normpath(os.path.join(root_output, rel_subpath))
         
         if not overwrite_flag and os.path.exists(target_out):
@@ -173,7 +184,7 @@ def main():
                     stats[res] += 1
                 
                 if idx % max(1, total_jobs // 50) == 0 or idx == total_jobs:
-                    print(f" -> Progression: [{idx}/{total_jobs}] ({.2f}%) Complete. (Converted: {stats['CONVERTED']} | Skipped: {stats['SKIPPED']})", flush=True)
+                    print(f" -> Progression: [{idx}/{total_jobs}] ({(idx / total_jobs) * 100:.2f}%) Complete. (Converted: {stats['CONVERTED']} | Skipped: {stats['SKIPPED']})", flush=True)
         except KeyboardInterrupt:
             print("\n[CRITICAL ALERT] User sent interrupt via termination control (Ctrl+C). Cleaning context matrices and shutting down pools...")
             pool.terminate()
