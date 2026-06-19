@@ -316,6 +316,7 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
     # Process in parallel, accumulate by agent_type
     agent_tables = defaultdict(list)
     processed_count = 0
+    failed_count = 0
     
     # Prepare task args with all_metrics and stride included
     task_args_list = [
@@ -326,6 +327,7 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
     with multiprocessing.Pool(processes=num_workers, initializer=init_worker) as pool:
         for result in pool.imap_unordered(process_source_file, task_args_list):
             if result is None:
+                failed_count += 1
                 continue
             
             agent_type = result['agent_type']
@@ -337,7 +339,11 @@ def run_unified_etl(root_dir, set_range, run_range, num_workers, output_dir,
                 print(f"[PROGRESS] Processed {processed_count} files...")
     
     if verbose:
-        print(f"[PROGRESS] Processed {processed_count} files total.")
+        print(f"[PROGRESS] Processed {processed_count} files total. Failures: {failed_count}")
+        
+    # Raise failure alert if any source tasks failed processing
+    if failed_count:
+        raise RuntimeError(f"{failed_count} source files failed to process")
     
     # Write sorted agent outputs
     for agent_type in agent_types:
