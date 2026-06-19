@@ -20,12 +20,12 @@ Prerequisites:
     - Provide CSV with parameter metadata (set_num, parameter columns)
 
 Usage:
-    python global_sensitivity_analysis.py \\
-        --checkpoint ./output/Bank/checkpoint_Bank.feather \\
-        --parameters ./parameters.csv \\
-        --metric wealth \\
-        --output ./plots \\
-        --percentile 95 \\
+    python global_sensitivity_analysis.py \
+        --checkpoint ./output/Bank/checkpoint_Bank.feather \
+        --parameters ./parameters.csv \
+        --metric wealth \
+        --output ./plots \
+        --percentile 95 \
         --verbose
 ================================================================================
 """
@@ -100,6 +100,7 @@ def get_iterator(checkpoint_path, file_format, columns):
     else:  # parquet
         return pq.ParquetFile(checkpoint_path).iter_batches(batch_size=50_000, columns=columns), None
 
+
 def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir, 
                                parameters_file_path, percentile_limit, verbose):
     """
@@ -119,22 +120,50 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
     # Load parameter metadata
     param_meta_df = pd.read_csv(parameters_file_path)
     param_meta_df['set_num'] = param_meta_df['set_num'].astype(str).str.extract(r'(\d+)').astype(int)
-    param_meta_df = param_meta_df.set_index('set_num').reindex(range(1, param_meta_df['set_num'].max() + 1))
+    param_meta_df = param_meta_df.set_index('set_num')
+    
+    # Track the maximum set_num present in the checkpoint file to build the lookup array safely
+    checkpoint_max_set = -1
+    unique_checkpoint_sets = set()
     
     # Calculate percentile threshold (sampling pass)
     log(f"[ANALYSIS] Calculating global metric boundaries...", verbose)
     sample_points = []
-    it, _ = get_iterator(checkpoint_path, file_format, [metric])
+    it, _ = get_iterator(checkpoint_path, file_format, ['set_num', metric])
     
     for batch in it:
         if metric not in batch.schema.names:
             raise ValueError(f"Metric {metric!r} not found in checkpoint")
+        
+        # Track unique set_num occurrences to validate parameter presence
+        batch_sets = batch.column('set_num').to_numpy()
+        if len(batch_sets) > 0:
+            unique_checkpoint_sets.update(batch_sets)
+            local_max = int(np.max(batch_sets))
+            if local_max > checkpoint_max_set:
+                checkpoint_max_set = local_max
+                
         sample_points.append(batch.column(metric).to_numpy())
         if sum(len(s) for s in sample_points) > 1_000_000:
+            # Continue scanning the rest of the file briefly if we need to guarantee set_num bounds
             break
+            
+    # Complete scanning to verify full set_num bounds across the entire checkpoint file
+    for batch in it:
+        batch_sets = batch.column('set_num').to_numpy()
+        if len(batch_sets) > 0:
+            unique_checkpoint_sets.update(batch_sets)
+            local_max = int(np.max(batch_sets))
+            if local_max > checkpoint_max_set:
+                checkpoint_max_set = local_max
     
     if not sample_points:
         raise ValueError(f"No finite values found for metric {metric!r}")
+        
+    # Fail early if any set IDs present in the checkpoint are entirely missing from the parameter metadata
+    missing_metadata_sets = unique_checkpoint_sets - set(param_meta_df.index)
+    if missing_metadata_sets:
+        raise ValueError(f"Parameter metadata file is missing records for checkpoint set numbers: {sorted(list(missing_metadata_sets))}")
 
     metric_sample = np.concatenate(sample_points)
     finite_metric_sample = metric_sample[np.isfinite(metric_sample)]
@@ -160,11 +189,15 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
     # Rendering pass: accumulate histograms
     for param_name in economic_params:
         log(f"[RENDER] Creating plot for {param_name.upper()}...", verbose)
-        param_vector = param_meta_df[param_name].values.astype(np.float32)
+        
+        # Build an explicit mapping array with validation bounds
+        max_set_index = int(max(param_meta_df.index.max(), checkpoint_max_set))
+        lookup = np.full(max_set_index + 1, np.nan, dtype=np.float32)
+        lookup[param_meta_df.index.to_numpy()] = param_meta_df[param_name].to_numpy(dtype=np.float32)
         
         # Pre-compute bin edges
         hist_grid = np.zeros((500, 500))
-        x_edges = np.linspace(param_vector.min(), param_vector.max(), 501)
+        x_edges = np.linspace(np.nanmin(lookup), np.nanmax(lookup), 501)
 
         # Fix negative metric values
         y_edges = np.linspace(lower, upper, 501)
@@ -177,12 +210,21 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
             mask = np.isfinite(vals) & (vals >= lower) & (vals <= upper)
             
             if np.any(mask):
-                H, _, _ = np.histogram2d(
-                    param_vector[sets[mask] - 1],
-                    vals[mask],
-                    bins=[x_edges, y_edges]
-                )
-                hist_grid += H
+                set_values = sets[mask].astype(np.int64)
+                
+                # Check bounds and ensure value is safely mapped inside the metadata lookup array
+                valid = (set_values >= 0) & (set_values < len(lookup)) & np.isfinite(lookup[set_values])
+                
+                if np.any(valid):
+                    x_coords = lookup[set_values[valid]]
+                    y_coords = vals[mask][valid]
+                    
+                    H, _, _ = np.histogram2d(
+                        x_coords,
+                        y_coords,
+                        bins=[x_edges, y_edges]
+                    )
+                    hist_grid += H
             
             del sets, vals, mask
         
@@ -208,7 +250,7 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
         if verbose:
             print(f"[WRITE] {output_path}")
         
-        del param_vector, hist_grid, fig, ax
+        del lookup, hist_grid, fig, ax
         if source:
             source.close()
         gc.collect()
