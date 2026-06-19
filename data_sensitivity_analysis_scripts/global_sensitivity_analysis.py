@@ -204,29 +204,33 @@ def generate_bifurcation_plots(checkpoint_path, metric, file_format, output_dir,
         
         # Stream batches, accumulate histogram
         it, source = get_iterator(checkpoint_path, file_format, ['set_num', metric])
-        for batch in it:
-            sets = batch.column('set_num').to_numpy()
-            vals = batch.column(metric).to_numpy()
-            mask = np.isfinite(vals) & (vals >= lower) & (vals <= upper)
-            
-            if np.any(mask):
-                set_values = sets[mask].astype(np.int64)
+        try:
+            for batch in it:
+                sets = batch.column('set_num').to_numpy()
+                vals = batch.column(metric).to_numpy()
+                mask = np.isfinite(vals) & (vals >= lower) & (vals <= upper)
                 
-                # Check bounds and ensure value is safely mapped inside the metadata lookup array
-                valid = (set_values >= 0) & (set_values < len(lookup)) & np.isfinite(lookup[set_values])
-                
-                if np.any(valid):
-                    x_coords = lookup[set_values[valid]]
-                    y_coords = vals[mask][valid]
+                if np.any(mask):
+                    set_values = sets[mask].astype(np.int64)
                     
-                    H, _, _ = np.histogram2d(
-                        x_coords,
-                        y_coords,
-                        bins=[x_edges, y_edges]
-                    )
-                    hist_grid += H
-            
-            del sets, vals, mask
+                    # Check bounds and ensure value is safely mapped inside the metadata lookup array
+                    valid = (set_values >= 0) & (set_values < len(lookup)) & np.isfinite(lookup[set_values])
+                    
+                    if np.any(valid):
+                        x_coords = lookup[set_values[valid]]
+                        y_coords = vals[mask][valid]
+                        
+                        H, _, _ = np.histogram2d(
+                            x_coords,
+                            y_coords,
+                            bins=[x_edges, y_edges]
+                        )
+                        hist_grid += H
+                
+                del sets, vals, mask
+        finally:
+            if source:
+            source.close()
         
         # Render and save
         fig, ax = plt.subplots(figsize=(11, 6))
