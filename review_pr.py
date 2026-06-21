@@ -36,7 +36,7 @@ def main():
 
     # Utilizing the free Llama 3.3 70B model which features strong instruction following
     response = client.chat.completions.create(
-        model="meta-llama/llama-3.3-70b-instruct:free",
+        model="google/gemini-2.5-flash:free",
         messages=[{"role": "user", "content": prompt}]
     )
 
