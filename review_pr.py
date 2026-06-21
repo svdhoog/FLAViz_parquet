@@ -46,7 +46,7 @@ def main():
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="mistralai/codestral-2501:free",
+                model="qwen/qwen-2.5-coder-32b-instruct:free",
                 messages=[{"role": "user", "content": prompt}]
             )
             candidate_output = response.choices[0].message.content.strip()
