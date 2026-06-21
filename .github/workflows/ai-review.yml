@@ -66,7 +66,17 @@ jobs:
           const execSync = require("child_process").execSync;
           
           try {
-            const data = JSON.parse(fs.readFileSync("review_response.json", "utf8"));
+            const rawContent = fs.readFileSync("review_response.json", "utf8").trim();
+            
+            // Regex to locate and extract the first valid JSON object block { ... } 
+            // even if surrounded by conversational prefaces or text.
+            const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+            if (!jsonMatch) {
+              throw new Error("No JSON object structure found in response.");
+            }
+            
+            const data = JSON.parse(jsonMatch[0]);
+            
             if (!data.issues || data.issues.length === 0) {
               fs.writeFileSync("pr_comment.md", "### 🤖 AI Code Review\n\nNo structural bugs or blocking issues were identified in this diff.");
               process.exit(0);
@@ -75,7 +85,6 @@ jobs:
             let summaryMarkdown = "### 🤖 AI Code Review: Automated Issues Tracked\n\nThe following issues have been automatically tracked in the repository for this branch:\n\n| Issue Title | Tracking Link |\n| --- | --- |\n";
             
             data.issues.forEach(issue => {
-              // Escape double quotes inside string parameters for shell safety
               const title = issue.title.replace(/"/g, "\\\"");
               const body = `${issue.body}\n\n*Originating from Pull Request #${{ github.event.issue.number }}*`.replace(/"/g, "\\\"");
               
@@ -87,8 +96,12 @@ jobs:
             
             fs.writeFileSync("pr_comment.md", summaryMarkdown);
           } catch (e) {
-            console.error(e);
-            fs.writeFileSync("pr_comment.md", "### ❌ AI Code Review Error\n\nThe model failed to return a cleanly formatted structural JSON object. Check execution logs for details.");
+            console.error("Parsing or Issue creation failed:", e.message);
+            
+            // Fall back gracefully by dumping the raw text content as a comment if the JSON was unparseable
+            const rawContent = fs.readFileSync("review_response.json", "utf8");
+            const fallbackMarkdown = `### ❌ AI Code Review Format Error\n\nThe model failed to provide structural JSON data. Falling back to raw response text:\n\n${rawContent}`;
+            fs.writeFileSync("pr_comment.md", fallbackMarkdown);
           }
           '
 
