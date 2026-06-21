@@ -5,10 +5,17 @@ import time
 from openai import OpenAI, RateLimitError
 
 def main():
-    # Fetch the code diff passed from the GitHub workflow environment
-    pr_diff = os.getenv("PR_DIFF")
+    # Read the diff content directly from the file to bypass OS environment size limits
+    diff_file_path = "pr_diff.txt"
+    if not os.path.exists(diff_file_path):
+        print("No PR diff file found at pr_diff.txt.")
+        sys.exit(0)
+        
+    with open(diff_file_path, "r", encoding="utf-8") as f:
+        pr_diff = f.read().strip()
+
     if not pr_diff:
-        print("No PR diff provided.")
+        print("PR diff file is empty.")
         sys.exit(0)
 
     # Initialize the client pointing to OpenRouter
@@ -40,7 +47,6 @@ def main():
     
     for attempt in range(max_retries):
         try:
-            # Switching to the active free Codestral model by Mistral
             response = client.chat.completions.create(
                 model="mistralai/codestral-2501:free",
                 messages=[{"role": "user", "content": prompt}]
@@ -55,7 +61,6 @@ def main():
 
     # Clean up markdown code block indicators if returned by the model
     if review_output.startswith("```"):
-        # Split lines and remove the markdown block syntax wrappers cleanly
         lines = review_output.splitlines()
         if lines[0].startswith("```"):
             lines = lines[1:]

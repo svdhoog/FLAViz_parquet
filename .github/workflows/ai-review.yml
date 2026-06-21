@@ -21,7 +21,6 @@ jobs:
       - name: Check out repository source
         uses: actions/checkout@v4
         with:
-          # Fetch all history so the local runner can accurately compute massive diffs
           fetch-depth: 0
 
       - name: Extract Pull Request Diff Locally
@@ -29,15 +28,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Query GitHub API via CLI to discover the precise base branch ref for this PR
           BASE_REF=$(gh pr view ${{ github.event.issue.number }} --json baseRefName --jq '.baseRefName')
-          
-          # Ensure the target base branch is locally available to calculate the diff
           git fetch origin "$BASE_REF"
-          
-          # Generate the complete local diff comparing the PR head directly to the base branch
           git diff origin/"$BASE_REF"...HEAD > pr_diff.txt
-          echo "DIFF_PATH=pr_diff.txt" >> $GITHUB_ENV
 
       - name: Set up Python environment
         uses: actions/setup-python@v5
@@ -53,7 +46,7 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          export PR_DIFF=$(cat pr_diff.txt)
+          # Safe execution without passing massive logs into environment strings
           python review_pr.py > review_response.json
 
       - name: Create GitHub Issues from AI Review Points
@@ -67,9 +60,6 @@ jobs:
           
           try {
             const rawContent = fs.readFileSync("review_response.json", "utf8").trim();
-            
-            // Regex to locate and extract the first valid JSON object block { ... } 
-            // even if surrounded by conversational prefaces or text.
             const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
             if (!jsonMatch) {
               throw new Error("No JSON object structure found in response.");
@@ -97,8 +87,6 @@ jobs:
             fs.writeFileSync("pr_comment.md", summaryMarkdown);
           } catch (e) {
             console.error("Parsing or Issue creation failed:", e.message);
-            
-            // Fall back gracefully by dumping the raw text content as a comment if the JSON was unparseable
             const rawContent = fs.readFileSync("review_response.json", "utf8");
             const fallbackMarkdown = `### ❌ AI Code Review Format Error\n\nThe model failed to provide structural JSON data. Falling back to raw response text:\n\n${rawContent}`;
             fs.writeFileSync("pr_comment.md", fallbackMarkdown);
