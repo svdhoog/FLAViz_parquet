@@ -28,11 +28,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Retrieve target base branch and source head branch names from GitHub CLI
           BASE_REF=$(gh pr view ${{ github.event.issue.number }} --json baseRefName --jq '.baseRefName')
           HEAD_REF=$(gh pr view ${{ github.event.issue.number }} --json headRefName --jq '.headRefName')
           
+          # Dynamically detect if the repository uses master or main as its default branch
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
+          
           echo "BASE_REF=$BASE_REF" >> $GITHUB_ENV
           echo "HEAD_REF=$HEAD_REF" >> $GITHUB_ENV
+          echo "DEFAULT_BRANCH=$DEFAULT_BRANCH" >> $GITHUB_ENV
           
           git fetch origin "$HEAD_REF"
           git checkout "$HEAD_REF"
@@ -57,7 +62,13 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          python review_pr.py
+          # Fetch the dynamically detected default branch reference
+          git fetch origin "${{ env.DEFAULT_BRANCH }}"
+          
+          # Extract the script from whichever default branch the repo uses (main or master)
+          git show origin/"${{ env.DEFAULT_BRANCH }}":review_pr.py > temp_review_pr.py
+          
+          python temp_review_pr.py
 
       - name: Create GitHub Issues from AI Review Points
         id: create_issues
@@ -92,7 +103,6 @@ jobs:
               const issueTitle = issue.title || "AI Reviewed Code Issue";
               const issueBody = `${issue.body || "No technical description provided."}\n\n*Originating from Pull Request #${{ github.event.issue.number }}*`;
               
-              // Safe argument array passing to eliminate shell token injection vectors
               const args = ["issue", "create", "--title", issueTitle, "--body", issueBody];
               const issueUrl = execFileSync("gh", args).toString().trim();
               
