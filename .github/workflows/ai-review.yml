@@ -6,14 +6,12 @@ on:
 
 jobs:
   review:
-    # Only run if the comment is on a Pull Request AND matches the exact command
-    # AND only run if the comment author's username matches your specific handle
     if: >
       github.event.issue.pull_request && 
       github.event.comment.body == '/review' && 
       github.actor == 'svdhoog'
     runs-on: ubuntu-latest
-    timeout-minutes: 5    # Force-kills the runner if it takes longer than 5 minutes
+    timeout-minutes: 5
     permissions:
       pull-requests: write
       contents: read
@@ -23,13 +21,11 @@ jobs:
       - name: Check out repository source
         uses: actions/checkout@v4
 
-      # When running on a comment, we must explicitly fetch the PR details to get the diff
       - name: Extract Pull Request Diff
         id: diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Use the GitHub CLI tool built into the runner to fetch the raw diff
           gh pr diff ${{ github.event.issue.number }} > pr_diff.txt
           echo "DIFF_PATH=pr_diff.txt" >> $GITHUB_ENV
 
@@ -48,7 +44,44 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           export PR_DIFF=$(cat pr_diff.txt)
-          python review_pr.py > review_response.txt
+          python review_pr.py > review_response.json
+
+      - name: Create GitHub Issues from AI Review Points
+        id: create_issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Use node to quickly parse the JSON list and generate GitHub issues via CLI
+          node -e '
+          const fs = require("fs");
+          const execSync = require("child_process").execSync;
+          
+          try {
+            const data = JSON.parse(fs.readFileSync("review_response.json", "utf8"));
+            if (!data.issues || data.issues.length === 0) {
+              fs.writeFileSync("pr_comment.md", "### 🤖 AI Code Review\n\nNo blocking issues identified.");
+              process.exit(0);
+            }
+            
+            let summaryMarkdown = "### 🤖 AI Code Review: Automated Issues Tracked\n\nThe following issues have been automatically registered for this branch:\n\n| Issue Title | Link |\n| --- | --- |\n";
+            
+            data.issues.forEach(issue => {
+              // Create the issue using GitHub CLI tool
+              const title = issue.title.replace(/"/g, "\\\"");
+              const body = `${issue.body}\n\n*Originating from PR #${{ github.event.issue.number }}*`.replace(/"/g, "\\\"");
+              
+              const command = `gh issue create --title "${title}" --body "${body}"`;
+              const issueUrl = execSync(command).toString().trim();
+              
+              summaryMarkdown += `| ${issue.title} | ${issueUrl} |\n`;
+            });
+            
+            fs.writeFileSync("pr_comment.md", summaryMarkdown);
+          } catch (e) {
+            console.error(e);
+            fs.writeFileSync("pr_comment.md", "### ❌ AI Code Review Error\n\nFailed to parse JSON structural format returned by the LLM.");
+          }
+          '
 
       - name: Comment Review on GitHub PR
         uses: actions/github-script@v7
@@ -56,13 +89,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const reviewBody = fs.readFileSync('review_response.txt', 'utf8');
+            const commentBody = fs.readFileSync('pr_comment.md', 'utf8');
             
-            if (reviewBody.trim()) {
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: "### 🤖 Requested AI Code Review via OpenRouter\n\n" + reviewBody
-              });
-            }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
