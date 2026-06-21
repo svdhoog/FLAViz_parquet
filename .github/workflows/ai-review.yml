@@ -20,13 +20,23 @@ jobs:
     steps:
       - name: Check out repository source
         uses: actions/checkout@v4
+        with:
+          # Fetch all history so the local runner can accurately compute massive diffs
+          fetch-depth: 0
 
-      - name: Extract Pull Request Diff
+      - name: Extract Pull Request Diff Locally
         id: diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr diff ${{ github.event.issue.number }} > pr_diff.txt
+          # Query GitHub API via CLI to discover the precise base branch ref for this PR
+          BASE_REF=$(gh pr view ${{ github.event.issue.number }} --json baseRefName --jq '.baseRefName')
+          
+          # Ensure the target base branch is locally available to calculate the diff
+          git fetch origin "$BASE_REF"
+          
+          # Generate the complete local diff comparing the PR head directly to the base branch
+          git diff origin/"$BASE_REF"...HEAD > pr_diff.txt
           echo "DIFF_PATH=pr_diff.txt" >> $GITHUB_ENV
 
       - name: Set up Python environment
@@ -51,7 +61,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Use node to quickly parse the JSON list and generate GitHub issues via CLI
           node -e '
           const fs = require("fs");
           const execSync = require("child_process").execSync;
@@ -59,16 +68,16 @@ jobs:
           try {
             const data = JSON.parse(fs.readFileSync("review_response.json", "utf8"));
             if (!data.issues || data.issues.length === 0) {
-              fs.writeFileSync("pr_comment.md", "### 🤖 AI Code Review\n\nNo blocking issues identified.");
+              fs.writeFileSync("pr_comment.md", "### 🤖 AI Code Review\n\nNo structural bugs or blocking issues were identified in this diff.");
               process.exit(0);
             }
             
-            let summaryMarkdown = "### 🤖 AI Code Review: Automated Issues Tracked\n\nThe following issues have been automatically registered for this branch:\n\n| Issue Title | Link |\n| --- | --- |\n";
+            let summaryMarkdown = "### 🤖 AI Code Review: Automated Issues Tracked\n\nThe following issues have been automatically tracked in the repository for this branch:\n\n| Issue Title | Tracking Link |\n| --- | --- |\n";
             
             data.issues.forEach(issue => {
-              // Create the issue using GitHub CLI tool
+              // Escape double quotes inside string parameters for shell safety
               const title = issue.title.replace(/"/g, "\\\"");
-              const body = `${issue.body}\n\n*Originating from PR #${{ github.event.issue.number }}*`.replace(/"/g, "\\\"");
+              const body = `${issue.body}\n\n*Originating from Pull Request #${{ github.event.issue.number }}*`.replace(/"/g, "\\\"");
               
               const command = `gh issue create --title "${title}" --body "${body}"`;
               const issueUrl = execSync(command).toString().trim();
@@ -79,11 +88,11 @@ jobs:
             fs.writeFileSync("pr_comment.md", summaryMarkdown);
           } catch (e) {
             console.error(e);
-            fs.writeFileSync("pr_comment.md", "### ❌ AI Code Review Error\n\nFailed to parse JSON structural format returned by the LLM.");
+            fs.writeFileSync("pr_comment.md", "### ❌ AI Code Review Error\n\nThe model failed to return a cleanly formatted structural JSON object. Check execution logs for details.");
           }
           '
 
-      - name: Comment Review on GitHub PR
+      - name: Comment Review Summary on GitHub PR
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
