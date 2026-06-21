@@ -22,13 +22,13 @@ OUTPUT_DIR='/home/sander/Documents/GIT/GitHub/FLAViz@svdhoog/FLAViz_parquet/sand
 
 # Usage:
 python ../unified_etl.py \
+  --sets 1-1 \
+  --runs 1-1 \
+  --agent-types "Eurostat" \
   --input "$INPUT_DIR" \
   --output "$OUTPUT_DIR" \
   --workers 2 \
-  --verbose \
-  --sets 1-513 \
-  --runs 1-1000 \
-  --agent-types "Eurostat"
-#  --sets 1-4 \
-#  --runs 1-2
-#  --agent-types "Bank,Firm"
+  --verbose
+#  --sets 1-513 \
+#  --runs 1-1000 \
+#  --agent-types "Bank, Firm"
