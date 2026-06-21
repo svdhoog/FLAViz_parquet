@@ -5,7 +5,6 @@ import time
 from openai import OpenAI, RateLimitError
 
 def main():
-    # Read the diff content directly from the file to bypass OS environment size limits
     diff_file_path = "pr_diff.txt"
     if not os.path.exists(diff_file_path):
         print("No PR diff file found at pr_diff.txt.")
@@ -18,7 +17,6 @@ def main():
         print("PR diff file is empty.")
         sys.exit(0)
 
-    # Initialize the client pointing to OpenRouter
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.getenv("OPENROUTER_API_KEY")
@@ -51,24 +49,38 @@ def main():
                 model="mistralai/codestral-2501:free",
                 messages=[{"role": "user", "content": prompt}]
             )
-            review_output = response.choices[0].message.content.strip()
-            break
-        except RateLimitError as e:
+            candidate_output = response.choices[0].message.content.strip()
+            
+            # Clean up markdown formatting blocks if present
+            if candidate_output.startswith("```"):
+                lines = candidate_output.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                candidate_output = "\n".join(lines).strip()
+            
+            # Isolate and validate JSON structure internally before approving
+            start_idx = candidate_output.find("{")
+            end_idx = candidate_output.rfind("}")
+            if start_idx != -1 and end_idx != -1:
+                json_string = candidate_output[start_idx:end_idx+1]
+                json.loads(json_string)  # Structural proof check
+                review_output = json_string
+                break
+            else:
+                raise ValueError("JSON braces missing in response output.")
+                
+        except (RateLimitError, ValueError, json.JSONDecodeError) as e:
             if attempt < max_retries - 1:
                 time.sleep(32)
             else:
-                raise e
+                # If all retries fail, write raw response string to let the workflow handle the fallback
+                review_output = response.choices[0].message.content.strip() if 'response' in locals() else str(e)
 
-    # Clean up markdown code block indicators if returned by the model
-    if review_output.startswith("```"):
-        lines = review_output.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        review_output = "\n".join(lines).strip()
-
-    print(review_output)
+    output_file_path = "review_response.json"
+    with open(output_file_path, "w", encoding="utf-8") as f:
+        f.write(review_output)
 
 if __name__ == "__main__":
     main()
