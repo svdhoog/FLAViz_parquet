@@ -18,19 +18,34 @@ jobs:
       issues: write
 
     steps:
-      - name: Check out repository source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Extract Pull Request Diff Locally
-        id: diff
+      - name: Fetch Pull Request Details
+        id: pr_metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Retrieve target base branch and source head branch names from GitHub CLI
           BASE_REF=$(gh pr view ${{ github.event.issue.number }} --json baseRefName --jq '.baseRefName')
-          git fetch origin "$BASE_REF"
-          git diff origin/"$BASE_REF"...HEAD > pr_diff.txt
+          HEAD_REF=$(gh pr view ${{ github.event.issue.number }} --json headRefName --jq '.headRefName')
+          
+          echo "BASE_REF=$BASE_REF" >> $GITHUB_ENV
+          echo "HEAD_REF=$HEAD_REF" >> $GITHUB_ENV
+
+      - name: Check out repository source
+        uses: actions/checkout@v4
+        with:
+          # Fetch all history so git can trace back to the common ancestor branch point
+          fetch-depth: 0
+          # Force checkout to pull down the feature branch instead of main
+          ref: ${{ env.HEAD_REF }}
+
+      - name: Extract Pull Request Diff Locally
+        id: diff
+        run: |
+          # Ensure the base branch target is locally available for comparison
+          git fetch origin "${{ env.BASE_REF }}"
+          
+          # Triple-dot diff compares the common ancestor of base and head, matching GitHub Web UI
+          git diff origin/"${{ env.BASE_REF }}"...HEAD > pr_diff.txt
 
       - name: Set up Python environment
         uses: actions/setup-python@v5
@@ -46,7 +61,6 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          # Safe execution without passing massive logs into environment strings
           python review_pr.py > review_response.json
 
       - name: Create GitHub Issues from AI Review Points
