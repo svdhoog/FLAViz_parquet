@@ -1,7 +1,8 @@
 import os
 import sys
 import json
-from openai import OpenAI
+import time
+from openai import OpenAI, RateLimitError
 
 def main():
     # Fetch the code diff passed from the GitHub workflow environment
@@ -12,7 +13,7 @@ def main():
 
     # Initialize the client pointing to OpenRouter
     client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
+        base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)",
         api_key=os.getenv("OPENROUTER_API_KEY")
     )
 
@@ -34,17 +35,33 @@ def main():
         f"```diff\n{pr_diff}\n```"
     )
 
-    # Utilizing the free Llama 3.3 70B model which features strong instruction following
-    response = client.chat.completions.create(
-        model="google/gemini-2.5-flash:free",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    review_output = response.choices[0].message.content.strip()
+    max_retries = 3
+    review_output = ""
     
-    # Strip markdown block wrappers if the model accidentally returns them despite instructions
+    for attempt in range(max_retries):
+        try:
+            # Switching to the active free Codestral model by Mistral
+            response = client.chat.completions.create(
+                model="mistralai/codestral-2501:free",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            review_output = response.choices[0].message.content.strip()
+            break
+        except RateLimitError as e:
+            if attempt < max_retries - 1:
+                time.sleep(32)
+            else:
+                raise e
+
+    # Clean up markdown code block indicators if returned by the model
     if review_output.startswith("```"):
-        review_output = review_output.strip("`").replace("json", "", 1).strip()
+        # Split lines and remove the markdown block syntax wrappers cleanly
+        lines = review_output.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        review_output = "\n".join(lines).strip()
 
     print(review_output)
 
